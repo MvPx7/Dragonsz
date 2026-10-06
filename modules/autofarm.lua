@@ -1,12 +1,16 @@
 -- modules/autofarm.lua
--- Segue o NPC mais próximo, fica na distância certa da hitbox e ataca.
--- Uso (igual ao anterior):
+-- Segue o NPC mais próximo, fica na distância certa da hitbox, ataca sozinho
+-- (simulando o clique M1) e detecta quando o NPC morre para pegar o próximo.
+--
+-- Uso:
 --   Autofarm.enable(player, distanceFn)            -- distanceFn() = folga em studs entre os corpos
 --   Autofarm.enable(player, distanceFn, { ... })   -- opções (opcional)
 --   Autofarm.disable()
+--   Autofarm.getKills()                            -- quantos NPCs já morreram nesta sessão
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
+local VirtualUser = game:GetService("VirtualUser")
 
 local Autofarm = {}
 
@@ -14,12 +18,15 @@ local STEP_NAME = "AutofarmFollow"
 local MY_RADIUS = 1.5 -- raio aproximado do seu personagem (studs)
 
 local DEFAULTS = {
-	behindNpc      = true,  -- fica nas costas do NPC (ataques costumam sair pela frente)
-	attackInterval = 0.15,  -- segundos entre ataques
-	smoothing      = 20,    -- maior = segue mais rápido; menor = mais suave
-	retargetEvery  = 0.5,   -- segundos entre buscas de novo alvo (quando não há alvo)
-	reachPadding   = 1.5,   -- tolerância extra do alcance de ataque (studs)
-	heightOffset   = 0,     -- ajuste de altura em relação ao NPC
+	behindNpc      = true,    -- fica nas costas do NPC (ataques costumam sair pela frente)
+	attackInterval = 0.15,    -- segundos entre ataques
+	attackMode     = "click", -- "click" = simula M1 | "tool" = tool:Activate()/RemoteEvent | "both"
+	clickFn        = nil,     -- função própria de ataque (substitui attackMode)
+	onKill         = nil,     -- função(npc, totalMortes) chamada quando o alvo morre
+	smoothing      = 20,      -- maior = segue mais rápido; menor = mais suave
+	retargetEvery  = 0.5,     -- segundos entre buscas de alvo (quando não há alvo)
+	reachPadding   = 1.5,     -- tolerância extra do alcance de ataque (studs)
+	heightOffset   = 0,       -- ajuste de altura em relação ao NPC
 }
 
 local state = nil
@@ -43,7 +50,7 @@ local function isNPC(model, myChar)
 	return isAlive(model)
 end
 
--- Raio horizontal real do NPC (usa a caixa que envolve o modelo inteiro)
+-- Raio horizontal real do NPC (caixa que envolve o modelo inteiro)
 local function getRadius(model)
 	local _, size = model:GetBoundingBox()
 	return math.max(size.X, size.Z) / 2
@@ -63,6 +70,48 @@ local function pickTarget(hrp, myChar)
 end
 
 ----------------------------------------------------------------
+-- Alvo e detecção de morte
+----------------------------------------------------------------
+local function clearTargetConns(s)
+	for _, c in ipairs(s.targetConns) do c:Disconnect() end
+	s.targetConns = {}
+end
+
+-- Solta o alvo atual. killed = true quando ele morreu (conta como kill)
+local function dropTarget(s, npc, killed)
+	if s.target ~= npc then return end -- evita contar duas vezes
+	clearTargetConns(s)
+	s.target = nil
+	s.lastScan = 0 -- procura o próximo alvo imediatamente
+
+	if killed then
+		s.kills += 1
+		if s.opts.onKill then
+			task.spawn(s.opts.onKill, npc, s.kills)
+		end
+	end
+end
+
+local function setTarget(s, npc)
+	clearTargetConns(s)
+	s.target = npc
+	if not npc then return end
+
+	s.radius = getRadius(npc)
+
+	local hum = npc:FindFirstChildOfClass("Humanoid")
+	if hum then
+		table.insert(s.targetConns, hum.Died:Connect(function()
+			dropTarget(s, npc, true)
+		end))
+	end
+	-- NPC removido do jogo sem morrer (despawn): só troca de alvo, sem contar kill
+	table.insert(s.targetConns, npc.AncestryChanged:Connect(function(_, parent)
+		if not parent then dropTarget(s, npc, false) end
+	end))
+end
+
+----------------------------------------------------------------
 -- Movimento (roda antes da câmera, em RenderStep, para não tremer)
 ----------------------------------------------------------------
 local function follow(dt)
@@ -78,20 +127,26 @@ local function follow(dt)
 	if s.prevAutoRotate == nil then s.prevAutoRotate = hum.AutoRotate end
 	hum.AutoRotate = false
 
-	-- Só procura alvo novo quando o atual morreu/sumiu (sem ficar trocando de alvo)
-	if not isAlive(s.target) then
-		s.target = nil
+	-- Garantia: se o alvo morreu/sumiu e o evento ainda não chegou, solta agora
+	if s.target and not isAlive(s.target) then
+		local tHum = s.target:FindFirstChildOfClass("Humanoid")
+		dropTarget(s, s.target, tHum ~= nil and tHum.Health <= 0)
+	end
+
+	-- Sem alvo: procura o mais próximo
+	if not s.target then
 		local now = os.clock()
 		if now - s.lastScan >= s.opts.retargetEvery then
 			s.lastScan = now
-			s.target = pickTarget(hrp, char)
-			s.radius = s.target and getRadius(s.target) or 0
+			local found = pickTarget(hrp, char)
+			if found then setTarget(s, found) end
 		end
 	end
 
 	local npc = s.target
 	if not npc then return end
 	local nHrp = getRoot(npc)
+	if not nHrp then return end
 
 	-- Distância centro-a-centro = raio do NPC + seu raio + folga configurada
 	local offset = s.radius + MY_RADIUS + s.distanceFn()
@@ -112,7 +167,7 @@ local function follow(dt)
 	local goalPos = npcPos + dir.Unit * offset
 	goalPos = Vector3.new(goalPos.X, npcPos.Y + s.opts.heightOffset, goalPos.Z)
 
-	-- Olha só na horizontal (sem inclinar o personagem, que bagunçava a câmera)
+	-- Olha só na horizontal (sem inclinar o personagem)
 	local lookAt = Vector3.new(npcPos.X, goalPos.Y, npcPos.Z)
 	local goal = CFrame.lookAt(goalPos, lookAt)
 
@@ -124,8 +179,36 @@ local function follow(dt)
 end
 
 ----------------------------------------------------------------
--- Ataque
+-- Ataque automático (sem precisar apertar M1)
 ----------------------------------------------------------------
+local function swing(s, char)
+	-- Função própria tem prioridade
+	if s.opts.clickFn then
+		pcall(s.opts.clickFn)
+		return
+	end
+
+	local mode = s.opts.attackMode
+
+	if mode == "click" or mode == "both" then
+		-- Simula o clique esquerdo do mouse
+		pcall(function()
+			VirtualUser:ClickButton1(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+		end)
+	end
+
+	if mode == "tool" or mode == "both" then
+		local tool = char:FindFirstChildOfClass("Tool")
+		if tool then
+			pcall(function() tool:Activate() end)
+			local remote = tool:FindFirstChild("RemoteEvent") or tool:FindFirstChild("Fire")
+			if remote and remote:IsA("RemoteEvent") then
+				pcall(function() remote:FireServer() end)
+			end
+		end
+	end
+end
+
 local function attack()
 	local s = state
 	if not s or not isAlive(s.target) then return end
@@ -144,22 +227,18 @@ local function attack()
 	local reach = s.radius + MY_RADIUS + s.distanceFn() + s.opts.reachPadding
 	if flat > reach then return end
 
-	-- Equipa uma ferramenta automaticamente se não houver nenhuma na mão
-	local tool = char:FindFirstChildOfClass("Tool")
-	if not tool then
+	-- Se há ferramenta na mochila e nenhuma na mão, equipa antes de atacar
+	if not char:FindFirstChildOfClass("Tool") then
 		local backpack = s.player:FindFirstChildOfClass("Backpack")
 		local first = backpack and backpack:FindFirstChildOfClass("Tool")
-		if first then hum:EquipTool(first) end
-		return
+		if first then
+			hum:EquipTool(first)
+			return
+		end
 	end
 
 	s.lastAttack = now
-	pcall(function() tool:Activate() end)
-
-	local remote = tool:FindFirstChild("RemoteEvent") or tool:FindFirstChild("Fire")
-	if remote and remote:IsA("RemoteEvent") then
-		pcall(function() remote:FireServer() end)
-	end
+	swing(s, char)
 end
 
 ----------------------------------------------------------------
@@ -174,13 +253,15 @@ function Autofarm.enable(player, distanceFn, options)
 	end
 
 	state = {
-		player     = player,
-		distanceFn = distanceFn or function() return 3 end,
-		opts       = opts,
-		target     = nil,
-		radius     = 0,
-		lastAttack = 0,
-		lastScan   = 0,
+		player       = player,
+		distanceFn   = distanceFn or function() return 3 end,
+		opts         = opts,
+		target       = nil,
+		targetConns  = {},
+		radius       = 0,
+		kills        = 0,
+		lastAttack   = 0,
+		lastScan     = 0,
 	}
 
 	RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Camera.Value - 1, follow)
@@ -192,6 +273,7 @@ function Autofarm.disable()
 
 	pcall(function() RunService:UnbindFromRenderStep(STEP_NAME) end)
 	if state.attackConn then state.attackConn:Disconnect() end
+	clearTargetConns(state)
 
 	local char = state.player.Character
 	local hum  = char and char:FindFirstChildOfClass("Humanoid")
@@ -200,6 +282,10 @@ function Autofarm.disable()
 	end
 
 	state = nil
+end
+
+function Autofarm.getKills()
+	return state and state.kills or 0
 end
 
 return Autofarm
