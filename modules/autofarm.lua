@@ -1,6 +1,6 @@
 -- modules/autofarm.lua
--- Segue o NPC mais próximo, fica na distância certa da hitbox, ataca sozinho
--- e detecta quando o NPC morre para pegar o próximo.
+-- Segue o NPC mais próximo, mantém o personagem MIRANDO nele (mesmo com Trava Shift),
+-- ataca sozinho e detecta quando o NPC morre para pegar o próximo.
 --
 -- Uso:
 --   Autofarm.enable(player, distanceFn)            -- distanceFn() = folga em studs entre os corpos
@@ -8,7 +8,7 @@
 --   Autofarm.disable()
 --   Autofarm.getKills()
 --
--- Para diagnosticar problemas: Autofarm.enable(player, distanceFn, { debug = true })
+-- Diagnóstico: Autofarm.enable(player, distanceFn, { debug = true })
 -- e olhe as linhas [Autofarm] no Output / Console (F9).
 
 local RunService = game:GetService("RunService")
@@ -18,13 +18,15 @@ local UserInputService = game:GetService("UserInputService")
 
 local Autofarm = {}
 
-local STEP_NAME = "AutofarmFollow"
+local MOVE_STEP = "AutofarmFollow"
+local AIM_STEP  = "AutofarmAim"
 local MY_RADIUS = 1.5 -- raio aproximado do seu personagem (studs)
 
 local DEFAULTS = {
 	behindNpc         = true,    -- fica nas costas do NPC
+	lockAim           = true,    -- personagem sempre virado para o NPC (vence a Trava Shift)
 	attackInterval    = 0.15,    -- segundos entre ataques
-	attackMode        = "click", -- "click" | "hold" | "tool" | "both" (click + tool)
+	attackMode        = "auto",  -- "auto" | "native" | "click" | "hold" | "tool"
 	clickFn           = nil,     -- função própria de ataque (substitui attackMode)
 	isDeadFn          = nil,     -- função(npc) -> true se o NPC está morto (jogos com vida própria)
 	onKill            = nil,     -- função(npc, totalMortes) chamada quando o alvo morre
@@ -90,6 +92,16 @@ local function pickTarget(hrp, myChar)
 		end
 	end
 	return nearest
+end
+
+-- Vira SÓ o personagem para o NPC (na horizontal), sem tocar na câmera
+local function aimAtTarget(s, hrp)
+	local nHrp = s.target and getRoot(s.target)
+	if not nHrp then return end
+	local p = hrp.Position
+	local look = Vector3.new(nHrp.Position.X, p.Y, nHrp.Position.Z)
+	if (look - p).Magnitude < 0.05 then return end
+	hrp.CFrame = CFrame.lookAt(p, look)
 end
 
 ----------------------------------------------------------------
@@ -183,14 +195,19 @@ local function debugTick(s, char, hrp)
 	end
 
 	local nHrp = getRoot(npc)
-	local flat = nHrp and Vector3.new(hrp.Position.X - nHrp.Position.X, 0, hrp.Position.Z - nHrp.Position.Z).Magnitude or -1
+	local toNpc = nHrp and Vector3.new(nHrp.Position.X - hrp.Position.X, 0, nHrp.Position.Z - hrp.Position.Z) or Vector3.zero
+	local look = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
+	local aimErr = 0
+	if toNpc.Magnitude > 0.01 and look.Magnitude > 0.01 then
+		aimErr = math.deg(math.acos(math.clamp(toNpc.Unit:Dot(look.Unit), -1, 1)))
+	end
 	local hum = npc:FindFirstChildOfClass("Humanoid")
 
 	log(s, string.format(
-		"alvo=%s vida=%s dist=%.1f alcance=%.1f ferramenta=%s | por segundo: ataques=%d fora_alcance=%d Tool.Activated=%d M1_no_UIS=%d | kills=%d",
+		"alvo=%s vida=%s dist=%.1f alcance=%.1f mira_erro=%.0f° ferramenta=%s | por segundo: ataques=%d fora_alcance=%d Tool.Activated=%d M1_no_UIS=%d | kills=%d",
 		npc.Name,
 		hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "sem humanoid",
-		flat, getReach(s),
+		toNpc.Magnitude, getReach(s), aimErr,
 		tool and tool.Name or "nenhuma",
 		s.swings, s.outOfRange, s.toolActivated, s.uisClicks, s.kills
 	))
@@ -198,7 +215,7 @@ local function debugTick(s, char, hrp)
 end
 
 ----------------------------------------------------------------
--- Movimento (roda antes da câmera, em RenderStep, para não tremer)
+-- Movimento (antes da câmera, para não tremer)
 ----------------------------------------------------------------
 local function follow(dt)
 	local s = state
@@ -209,7 +226,7 @@ local function follow(dt)
 	local hum  = char and char:FindFirstChildOfClass("Humanoid")
 	if not hrp or not hum or hum.Health <= 0 then return end
 
-	-- Impede o personagem de girar sozinho (evita briga com a câmera)
+	-- Impede o personagem de girar sozinho
 	if s.prevAutoRotate == nil then s.prevAutoRotate = hum.AutoRotate end
 	hum.AutoRotate = false
 
@@ -255,15 +272,28 @@ local function follow(dt)
 	local goalPos = npcPos + dir.Unit * offset
 	goalPos = Vector3.new(goalPos.X, npcPos.Y + s.opts.heightOffset, goalPos.Z)
 
-	-- Olha só na horizontal (sem inclinar o personagem)
-	local lookAt = Vector3.new(npcPos.X, goalPos.Y, npcPos.Z)
-	local goal = CFrame.lookAt(goalPos, lookAt)
-
-	-- Movimento suave (independe do FPS)
+	-- Posição suave (independe do FPS)
 	local alpha = 1 - math.exp(-s.opts.smoothing * dt)
-	hrp.CFrame = hrp.CFrame:Lerp(goal, alpha)
+	local newPos = hrp.Position:Lerp(goalPos, alpha)
+
+	local lookAt = Vector3.new(npcPos.X, newPos.Y, npcPos.Z)
+	if (lookAt - newPos).Magnitude > 0.05 then
+		hrp.CFrame = CFrame.lookAt(newPos, lookAt)
+	else
+		hrp.CFrame = CFrame.new(newPos) * hrp.CFrame.Rotation
+	end
 	hrp.AssemblyLinearVelocity = Vector3.zero
 	hrp.AssemblyAngularVelocity = Vector3.zero
+end
+
+-- Roda DEPOIS da câmera: a Trava Shift vira o personagem para onde a câmera olha,
+-- então reaplicamos a mira no NPC logo depois. A câmera não é alterada.
+local function aim()
+	local s = state
+	if not s or not s.opts.lockAim or not s.target then return end
+	local char = s.player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if hrp then aimAtTarget(s, hrp) end
 end
 
 ----------------------------------------------------------------
@@ -278,18 +308,32 @@ local function swing(s, char)
 	local mode = s.opts.attackMode
 	local cam = workspace.CurrentCamera
 
-	if mode == "click" or mode == "both" then
+	-- "mouse1click" só existe em alguns ambientes de execução; no Roblox normal é nil
+	local hasNative = type(mouse1click) == "function"
+
+	local useNative = (mode == "native") or (mode == "auto" and hasNative)
+	local useClick  = (mode == "click") or (mode == "auto" and not hasNative)
+	local useHold   = (mode == "hold")
+	local useTool   = (mode == "tool") or (mode == "auto")
+
+	if useNative and hasNative then
+		pcall(mouse1click)
+	end
+
+	if useClick then
 		pcall(function()
 			VirtualUser:ClickButton1(Vector2.new(0, 0), cam.CFrame)
 		end)
-	elseif mode == "hold" then
+	end
+
+	if useHold then
 		pcall(function() VirtualUser:Button1Down(Vector2.new(0, 0), cam.CFrame) end)
 		task.delay(0.05, function()
 			pcall(function() VirtualUser:Button1Up(Vector2.new(0, 0), cam.CFrame) end)
 		end)
 	end
 
-	if mode == "tool" or mode == "both" then
+	if useTool then
 		local tool = char:FindFirstChildOfClass("Tool")
 		if tool then
 			pcall(function() tool:Activate() end)
@@ -331,6 +375,9 @@ local function attack()
 			return
 		end
 	end
+
+	-- Garante a mira no NPC no instante do golpe (depois da física, antes de enviar ao servidor)
+	if s.opts.lockAim then aimAtTarget(s, hrp) end
 
 	s.lastAttack = now
 	s.swings += 1
@@ -377,17 +424,19 @@ function Autofarm.enable(player, distanceFn, options)
 				state.uisClicks += 1
 			end
 		end)
-		log(state, "ligado | attackMode =", opts.attackMode)
+		log(state, "ligado | attackMode =", opts.attackMode, "| mouse1click disponível =", type(mouse1click) == "function")
 	end
 
-	RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Camera.Value - 1, follow)
+	RunService:BindToRenderStep(MOVE_STEP, Enum.RenderPriority.Camera.Value - 1, follow)
+	RunService:BindToRenderStep(AIM_STEP, Enum.RenderPriority.Camera.Value + 1, aim)
 	state.attackConn = RunService.Heartbeat:Connect(attack)
 end
 
 function Autofarm.disable()
 	if not state then return end
 
-	pcall(function() RunService:UnbindFromRenderStep(STEP_NAME) end)
+	pcall(function() RunService:UnbindFromRenderStep(MOVE_STEP) end)
+	pcall(function() RunService:UnbindFromRenderStep(AIM_STEP) end)
 	if state.attackConn then state.attackConn:Disconnect() end
 	if state.uisConn then state.uisConn:Disconnect() end
 	if state.toolConn then state.toolConn:Disconnect() end
