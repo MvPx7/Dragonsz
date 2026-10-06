@@ -1,414 +1,205 @@
+-- modules/autofarm.lua
+-- Segue o NPC mais próximo, fica na distância certa da hitbox e ataca.
+-- Uso (igual ao anterior):
+--   Autofarm.enable(player, distanceFn)            -- distanceFn() = folga em studs entre os corpos
+--   Autofarm.enable(player, distanceFn, { ... })   -- opções (opcional)
+--   Autofarm.disable()
+
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
-local UIS = game:GetService("UserInputService")
-local GuiService = game:GetService("GuiService")
 
 local Autofarm = {}
 
--- ===== Ajustes =====
-local ATTACK_INTERVAL = 0.12   -- segundos entre cada ataque/clique
-local SEARCH_INTERVAL = 0.3    -- segundos entre buscas de alvo quando não há nenhum
-local ORBIT_SPEED     = 2.5    -- velocidade da volta em radianos/s
-local FLIP_MIN        = 1.5    -- o sentido da volta inverte sozinho a cada FLIP_MIN..FLIP_MAX segundos
-local FLIP_MAX        = 3
-local ATTACK_MODE     = "auto" -- "auto": usa o evento da ferramenta se existir, senão clica (M1) | "click": sempre clica
+local STEP_NAME = "AutofarmFollow"
+local MY_RADIUS = 1.5 -- raio aproximado do seu personagem (studs)
 
--- Esquiva: quando o NPC começa uma animação de ataque, o jogador sai da frente dele
-local DODGE_ENABLED = true
-local DODGE_STYLE   = "behind" -- "behind": vai para as COSTAS do NPC e continua batendo (rápido)
-                               -- "away": recua para longe e não bate durante a esquiva (mais seguro, mais lento)
-local SAFE_RADIUS   = 12       -- só no estilo "away": distância do recuo
-local DODGE_HOLD    = 1.2      -- tempo MÁXIMO da esquiva; ela termina antes, assim que a animação do NPC acaba
-local DODGE_POLL    = 0.05     -- de quanto em quanto tempo verifica se o NPC está atacando
+local DEFAULTS = {
+	behindNpc      = true,  -- fica nas costas do NPC (ataques costumam sair pela frente)
+	attackInterval = 0.15,  -- segundos entre ataques
+	smoothing      = 20,    -- maior = segue mais rápido; menor = mais suave
+	retargetEvery  = 0.5,   -- segundos entre buscas de novo alvo (quando não há alvo)
+	reachPadding   = 1.5,   -- tolerância extra do alcance de ataque (studs)
+	heightOffset   = 0,     -- ajuste de altura em relação ao NPC
+}
 
--- Mira fixa: a câmera fica travada olhando para o NPC (o mouse/câmera não "balançam" mais)
-local LOCK_CAMERA = true
-local CAM_BACK    = 7          -- distância da câmera atrás do jogador
-local CAM_HEIGHT  = 5          -- altura da câmera
+local state = nil
 
-local DEAD_IGNORE = 4          -- segundos que um NPC morto é ignorado (evita bater no corpo)
-local REACTION_WINDOW = 0.25  -- animação que começa até X s depois do NPC levar dano = reação ao seu golpe, NÃO ataque
-local STUCK_SECONDS = 7        -- sem causar dano por X segundos: larga o alvo (evita ficar travado num NPC inalcançável)
-local STUCK_IGNORE  = 3        -- e ignora esse NPC por X segundos
--- Proteção do clique: o clique simulado vai para onde o mouse está, então ele NÃO clica quando:
---   * o mouse está sobre um menu/botão, ou o menu do Roblox está aberto, ou você está digitando
---   * você mexeu o mouse ou apertou uma tecla nos últimos USER_PAUSE segundos
-local SAFE_CLICK = true
-local USER_PAUSE = 1.5
-local DEBUG       = false      -- true = mostra no console as animações do NPC (ajuda a calibrar a esquiva)
-
-local okVim, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
-if not okVim then VIM = nil end
-
--- Prioridades de animação que costumam ser ataques (idle/andar usam prioridades mais baixas)
-local ACTION = {}
-for _, name in ipairs({ "Action", "Action2", "Action3", "Action4" }) do
-	local ok, p = pcall(function() return Enum.AnimationPriority[name] end)
-	if ok and p then ACTION[p] = true end
-end
-local IGNORE_NAMES = { "idle", "walk", "run", "jump", "fall", "climb", "swim", "sit", "emote", "dance",
-	"hurt", "damage", "stun", "stagger", "flinch", "react", "knock", "dead", "death", "spawn", "taunt" }
-
-local active = false
-local conns = {}       -- todas as conexões, para desligar tudo de uma vez
-local npcs = {}        -- [model] = humanoid (lista em cache, mantida por eventos)
-local died = {}        -- [model] = conexão do evento Died
-local ignoredUntil = {} -- [model] = os.clock() até quando ignorar
-local seenAnims = {}
-local lastDamage = {}  -- [model] = quando o NPC levou dano pela última vez
-local hconns = {}      -- [model] = conexão do HealthChanged
-local trackState = {}  -- [animação] = "attack" | "reaction"
-local targetSince, noTarget = 0, 0
-local lastUserInput, lastBlockMsg = 0, 0
-local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Exclude
-local target, orbitTarget = nil, nil
-local angle, orbitDir, flipLeft = 0, 1, 2
-local attackTimer, searchTimer, pollTimer, dodgeUntil = 0, 0, 0, 0
-local onStopCb = nil
-local camLocked, savedCamType = false, nil
-local CAM_STEP = "DragonszFarmCam"
-
-local function rootOf(model)
+----------------------------------------------------------------
+-- Utilidades
+----------------------------------------------------------------
+local function getRoot(model)
 	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
 end
 
-local function usable(model, hum)
-	return hum.Health > 0 and (ignoredUntil[model] or 0) <= os.clock()
+local function isAlive(npc)
+	if not npc or not npc.Parent or not npc:IsDescendantOf(workspace) then return false end
+	local hum = npc:FindFirstChildOfClass("Humanoid")
+	return hum ~= nil and hum.Health > 0 and getRoot(npc) ~= nil
 end
 
-local function markDead(model)
-	ignoredUntil[model] = os.clock() + DEAD_IGNORE
-	if target == model then target = nil end
+local function isNPC(model, myChar)
+	if not model:IsA("Model") or model == myChar then return false end
+	if Players:GetPlayerFromCharacter(model) then return false end
+	return isAlive(model)
 end
 
-local function register(hum)
-	local model = hum.Parent
-	if not model or not model:IsA("Model") then return end
-	if Players:GetPlayerFromCharacter(model) then return end
-	npcs[model] = hum
-	if died[model] then died[model]:Disconnect() end
-	died[model] = hum.Died:Connect(function() markDead(model) end) -- reage na hora, sem esperar o próximo frame
-	if hconns[model] then hconns[model]:Disconnect() end
-	local lastHp = hum.Health
-	hconns[model] = hum.HealthChanged:Connect(function(h)
-		if h < lastHp then lastDamage[model] = os.clock() end -- anota quando o NPC leva dano
-		lastHp = h
-	end)
+-- Raio horizontal real do NPC (usa a caixa que envolve o modelo inteiro)
+local function getRadius(model)
+	local _, size = model:GetBoundingBox()
+	return math.max(size.X, size.Z) / 2
 end
 
-local function unregister(model)
-	if not model then return end
-	npcs[model] = nil
-	ignoredUntil[model] = nil
-	if died[model] then died[model]:Disconnect(); died[model] = nil end
-	if hconns[model] then hconns[model]:Disconnect(); hconns[model] = nil end
-	lastDamage[model] = nil
-	if target == model then target = nil end
-end
-
--- Procura só dentro da lista em cache (poucos itens), nunca no workspace inteiro.
-local function pickTarget(hrp)
-	local best, bestDist = nil, math.huge
-	for model, hum in pairs(npcs) do
-		if not model:IsDescendantOf(workspace) or Players:GetPlayerFromCharacter(model) then
-			unregister(model)
-		elseif usable(model, hum) then
-			local r = rootOf(model)
-			if r then
-				local d = (hrp.Position - r.Position).Magnitude
-				if d < bestDist then best, bestDist = model, d end
-			end
-		end
-	end
-	return best
-end
-
--- O NPC está tocando uma animação de ataque? (ignora as reações ao dano que o próprio jogador causa)
-local function isAttacking(model, hum)
-	local animator = hum:FindFirstChildOfClass("Animator")
-	if not animator then return false, 0 end
-	local playing, result, remaining = {}, false, 0
-	for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-		if DEBUG then
-			local key = track.Name .. "|" .. tostring(track.Priority)
-			if not seenAnims[key] then
-				seenAnims[key] = true
-				print(string.format("[Dragonsz DEBUG] animação do NPC: '%s'  prioridade=%s  loop=%s",
-					track.Name, tostring(track.Priority), tostring(track.Looped)))
-			end
-		end
-		if track.IsPlaying and not track.Looped and track.WeightCurrent > 0.1 and ACTION[track.Priority] then
-			playing[track] = true
-			if not trackState[track] then
-				-- Primeira vez que vemos essa animação tocar: começou logo depois de o NPC levar dano? Então é reação.
-				trackState[track] = (os.clock() - (lastDamage[model] or 0) < REACTION_WINDOW) and "reaction" or "attack"
-				if DEBUG then print(string.format("[Dragonsz DEBUG] '%s' classificada como: %s", track.Name, trackState[track])) end
-			end
-			if trackState[track] == "attack" then
-				local n = track.Name:lower()
-				local skip = false
-				for _, w in ipairs(IGNORE_NAMES) do
-					if n:find(w, 1, true) then skip = true; break end
-				end
-				if not skip then
-					local rem = track.Length - track.TimePosition -- quanto falta para o golpe terminar
-					if rem <= 0 then rem = 0.4 end
-					result = true
-					if rem > remaining then remaining = rem end
-				end
-			end
-		end
-	end
-	for tr in pairs(trackState) do
-		if not playing[tr] then trackState[tr] = nil end -- animação terminou: esquece
-	end
-	return result, remaining
-end
-
--- Clique M1 no lugar onde o mouse já está (o cursor não se mexe)
-local function clickM1()
-	local pos = UIS:GetMouseLocation()
-	if VIM then
-		VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-		VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-	elseif mouse1click then
-		mouse1click()
-	end
-end
-
--- O mouse está sobre um botão/menu da tela?
-local function overInteractiveGui(pos)
-	local lp = Players.LocalPlayer
-	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
-	if not pg then return false end
-	local inset = GuiService:GetGuiInset()
-	local ok, objs = pcall(function() return pg:GetGuiObjectsAtPosition(pos.X, pos.Y - inset.Y) end)
-	if not ok then return false end
-	for _, o in ipairs(objs) do
-		if o:IsA("GuiButton") or o.Active then return true end
-	end
-	return false
-end
-
--- Pode clicar agora sem atrapalhar o que você está fazendo?
-local function canClick()
-	if not SAFE_CLICK then return true end
-	local reason
-	if GuiService.MenuIsOpen then reason = "menu do Roblox aberto"
-	elseif UIS:GetFocusedTextBox() then reason = "você está digitando"
-	elseif os.clock() - lastUserInput < USER_PAUSE then reason = "você está usando o mouse/teclado"
-	elseif overInteractiveGui(UIS:GetMouseLocation()) then reason = "mouse sobre um menu" end
-	if reason and DEBUG and os.clock() - lastBlockMsg > 2 then
-		lastBlockMsg = os.clock()
-		print("[Dragonsz DEBUG] clique pausado: " .. reason)
-	end
-	return reason == nil
-end
-
-local function attack(char)
-	if ATTACK_MODE == "auto" then
-		local tool = char:FindFirstChildOfClass("Tool")
-		if tool and tool:FindFirstChild("Handle") then
-			local remote = tool:FindFirstChild("RemoteEvent") or tool:FindFirstChild("Fire")
-			if remote then
-				pcall(function() remote:FireServer() end)
-				return
-			end
-		end
-	end
-	if canClick() then pcall(clickM1) end
-end
-
-local function startOrbit(hrp, nHrp)
-	local rel = hrp.Position - nHrp.Position
-	angle = math.atan2(rel.Z, rel.X)
-	orbitDir = (math.random() < 0.5) and 1 or -1
-	flipLeft = FLIP_MIN + math.random() * (FLIP_MAX - FLIP_MIN)
-end
-
-local function lockCamera(player)
-	if not LOCK_CAMERA or camLocked then return end
-	local cam = workspace.CurrentCamera
-	if not cam then return end
-	savedCamType = cam.CameraType
-	cam.CameraType = Enum.CameraType.Scriptable
-	camLocked = true
-	RunService:BindToRenderStep(CAM_STEP, Enum.RenderPriority.Camera.Value + 1, function()
-		local c = workspace.CurrentCamera
-		local char = player.Character
-		local hrp = char and char:FindFirstChild("HumanoidRootPart")
-		local nHrp = target and rootOf(target)
-		if not c or not hrp or not nHrp then return end
-		local away = hrp.Position - nHrp.Position
-		away = Vector3.new(away.X, 0, away.Z)
-		if away.Magnitude < 0.1 then away = Vector3.new(0, 0, 1) end
-		local camPos = hrp.Position + away.Unit * CAM_BACK + Vector3.new(0, CAM_HEIGHT, 0)
-		c.CFrame = CFrame.new(camPos, nHrp.Position)
-	end)
-end
-
-local function unlockCamera()
-	if not camLocked then return end
-	camLocked = false
-	pcall(function() RunService:UnbindFromRenderStep(CAM_STEP) end)
-	local cam = workspace.CurrentCamera
-	if cam then
-		cam.CameraType = savedCamType or Enum.CameraType.Custom
-		local lp = Players.LocalPlayer
-		local hum = lp and lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
-		if hum then cam.CameraSubject = hum end
-	end
-end
-
--- Desliga sozinho (ex.: o jogador morreu) e avisa a UI, se ela registrou um callback
-local function stop(reason)
-	if not active then return end
-	local cb = Autofarm.onStopped or onStopCb
-	Autofarm.disable()
-	print("[Dragonsz Autofarm] desligado: " .. tostring(reason))
-	if cb then pcall(cb, reason) end
-end
-
--- onStop (opcional): função chamada quando o autofarm desliga sozinho, para a UI desmarcar o botão.
-function Autofarm.enable(player, distanceFn, onStop)
-	Autofarm.disable() -- garante que nunca existam duas conexões ao mesmo tempo
-	active = true
-	onStopCb = onStop
-
+local function pickTarget(hrp, myChar)
+	local nearest, nearestDist = nil, math.huge
 	for _, obj in ipairs(workspace:GetDescendants()) do
-		if obj:IsA("Humanoid") then register(obj) end
-	end
-	conns[#conns + 1] = workspace.DescendantAdded:Connect(function(obj)
-		if obj:IsA("Humanoid") then register(obj) end
-	end)
-	conns[#conns + 1] = workspace.DescendantRemoving:Connect(function(obj)
-		if obj:IsA("Humanoid") then unregister(obj.Parent) end
-	end)
-
-	-- Se o jogador morrer (ou o personagem for removido), desliga
-	conns[#conns + 1] = player.CharacterRemoving:Connect(function() stop("o personagem foi removido") end)
-	local myChar = player.Character
-	local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
-	if myHum then
-		conns[#conns + 1] = myHum.Died:Connect(function() stop("você morreu") end)
-	end
-
-	-- Detecta quando VOCÊ está usando o mouse ou o teclado (para pausar os cliques)
-	conns[#conns + 1] = UIS.InputChanged:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseMovement and input.Delta.Magnitude > 2 then
-			lastUserInput = os.clock()
-		end
-	end)
-	conns[#conns + 1] = UIS.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.Keyboard then lastUserInput = os.clock() end
-	end)
-
-	lockCamera(player)
-
-	conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt)
-		local char = player.Character
-		local hum = char and char:FindFirstChildOfClass("Humanoid")
-		if hum and hum.Health <= 0 then stop("você morreu"); return end
-		local hrp = char and char:FindFirstChild("HumanoidRootPart")
-		if not hrp then return end
-
-		-- Mantém o mesmo alvo até ele morrer ou sumir
-		if target then
-			local nh = npcs[target]
-			if not nh or not usable(target, nh) or not rootOf(target) then target = nil end
-		end
-		if not target then
-			noTarget = noTarget + dt
-			if noTarget > 0.6 then unlockCamera() end -- sem alvo: devolve a câmera ao normal
-			searchTimer = searchTimer + dt
-			if searchTimer < SEARCH_INTERVAL then return end
-			searchTimer = 0
-			target = pickTarget(hrp)
-			if not target then return end
-			noTarget, targetSince = 0, os.clock()
-			lockCamera(player)
-		end
-
-		-- Muito tempo sem causar dano (NPC inalcançável ou invulnerável)? Larga o alvo para não ficar travado
-		if os.clock() - math.max(targetSince, lastDamage[target] or 0) > STUCK_SECONDS then
-			ignoredUntil[target] = os.clock() + STUCK_IGNORE
-			print("[Dragonsz Autofarm] " .. STUCK_SECONDS .. "s sem causar dano, trocando de alvo")
-			target = nil
-			return
-		end
-
-		local nHrp = rootOf(target)
-		if orbitTarget ~= target then
-			orbitTarget = target
-			startOrbit(hrp, nHrp)
-		end
-
-		-- Esquiva: ataque do NPC detectado -> recua para fora do alcance por um instante
-		if DODGE_ENABLED then
-			pollTimer = pollTimer + dt
-			if pollTimer >= DODGE_POLL then
-				pollTimer = 0
-				local atk, remaining = isAttacking(target, npcs[target])
-				if atk then dodgeUntil = os.clock() + math.min(remaining + 0.1, DODGE_HOLD) end
+		if isNPC(obj, myChar) then
+			local d = (hrp.Position - getRoot(obj).Position).Magnitude
+			if d < nearestDist then
+				nearest, nearestDist = obj, d
 			end
 		end
-		local dodging = os.clock() < dodgeUntil
+	end
+	return nearest
+end
 
-		-- Gira em volta do NPC, sempre olhando para ele
-		angle = angle + ORBIT_SPEED * orbitDir * dt
-		flipLeft = flipLeft - dt
-		if flipLeft <= 0 then
-			orbitDir = -orbitDir
-			flipLeft = FLIP_MIN + math.random() * (FLIP_MAX - FLIP_MIN)
-		end
-		local radius = distanceFn()
-		local c = nHrp.Position
-		local pos
-		if dodging and DODGE_STYLE == "behind" then
-			-- Costas do NPC, na mesma distância de sempre (continua ao alcance do seu ataque)
-			local look = nHrp.CFrame.LookVector
-			look = Vector3.new(look.X, 0, look.Z)
-			if look.Magnitude < 0.1 then look = Vector3.new(0, 0, 1) end
-			look = look.Unit
-			pos = Vector3.new(c.X - look.X * radius, c.Y, c.Z - look.Z * radius)
-			angle = math.atan2(pos.Z - c.Z, pos.X - c.X) -- a volta continua daqui, sem pular de volta
-		else
-			if dodging then radius = math.max(radius, SAFE_RADIUS) end
-			pos = Vector3.new(c.X + math.cos(angle) * radius, c.Y, c.Z + math.sin(angle) * radius)
-		end
-		-- Fica sempre no chão (se o NPC for lançado ao ar, o jogador não flutua junto)
-		rayParams.FilterDescendantsInstances = { char, target }
-		local ground = workspace:Raycast(Vector3.new(pos.X, c.Y + 4, pos.Z), Vector3.new(0, -300, 0), rayParams)
-		if ground then
-			local stand = (hum and hum.HipHeight or 2) + hrp.Size.Y / 2
-			pos = Vector3.new(pos.X, math.min(c.Y, ground.Position.Y + stand), pos.Z)
-		end
-		hrp.CFrame = CFrame.new(pos, Vector3.new(c.X, pos.Y, c.Z))
-		hrp.AssemblyLinearVelocity = Vector3.zero
+----------------------------------------------------------------
+-- Movimento (roda antes da câmera, em RenderStep, para não tremer)
+----------------------------------------------------------------
+local function follow(dt)
+	local s = state
+	if not s then return end
 
-		-- Ataca (no estilo "away" não bate durante a esquiva; nunca bate em NPC morto)
-		attackTimer = attackTimer + dt
-		if attackTimer >= ATTACK_INTERVAL then
-			attackTimer = 0
-			local nh = npcs[target]
-			if (not dodging or DODGE_STYLE == "behind") and nh and usable(target, nh) then attack(char) end
+	local char = s.player.Character
+	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+	local hum  = char and char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum or hum.Health <= 0 then return end
+
+	-- Impede o personagem de girar sozinho (evita briga com a câmera)
+	if s.prevAutoRotate == nil then s.prevAutoRotate = hum.AutoRotate end
+	hum.AutoRotate = false
+
+	-- Só procura alvo novo quando o atual morreu/sumiu (sem ficar trocando de alvo)
+	if not isAlive(s.target) then
+		s.target = nil
+		local now = os.clock()
+		if now - s.lastScan >= s.opts.retargetEvery then
+			s.lastScan = now
+			s.target = pickTarget(hrp, char)
+			s.radius = s.target and getRadius(s.target) or 0
 		end
-	end)
+	end
+
+	local npc = s.target
+	if not npc then return end
+	local nHrp = getRoot(npc)
+
+	-- Distância centro-a-centro = raio do NPC + seu raio + folga configurada
+	local offset = s.radius + MY_RADIUS + s.distanceFn()
+	local npcPos = nHrp.Position
+
+	local dir
+	if s.opts.behindNpc then
+		dir = -nHrp.CFrame.LookVector
+	else
+		dir = hrp.Position - npcPos
+	end
+	dir = Vector3.new(dir.X, 0, dir.Z)
+	if dir.Magnitude < 0.01 then
+		dir = -hrp.CFrame.LookVector
+		dir = Vector3.new(dir.X, 0, dir.Z)
+	end
+
+	local goalPos = npcPos + dir.Unit * offset
+	goalPos = Vector3.new(goalPos.X, npcPos.Y + s.opts.heightOffset, goalPos.Z)
+
+	-- Olha só na horizontal (sem inclinar o personagem, que bagunçava a câmera)
+	local lookAt = Vector3.new(npcPos.X, goalPos.Y, npcPos.Z)
+	local goal = CFrame.lookAt(goalPos, lookAt)
+
+	-- Movimento suave (independe do FPS)
+	local alpha = 1 - math.exp(-s.opts.smoothing * dt)
+	hrp.CFrame = hrp.CFrame:Lerp(goal, alpha)
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.AssemblyAngularVelocity = Vector3.zero
+end
+
+----------------------------------------------------------------
+-- Ataque
+----------------------------------------------------------------
+local function attack()
+	local s = state
+	if not s or not isAlive(s.target) then return end
+
+	local now = os.clock()
+	if now - s.lastAttack < s.opts.attackInterval then return end
+
+	local char = s.player.Character
+	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+	local hum  = char and char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum or hum.Health <= 0 then return end
+
+	-- Só ataca se estiver dentro do alcance (evita bater no ar)
+	local nPos = getRoot(s.target).Position
+	local flat = Vector3.new(hrp.Position.X - nPos.X, 0, hrp.Position.Z - nPos.Z).Magnitude
+	local reach = s.radius + MY_RADIUS + s.distanceFn() + s.opts.reachPadding
+	if flat > reach then return end
+
+	-- Equipa uma ferramenta automaticamente se não houver nenhuma na mão
+	local tool = char:FindFirstChildOfClass("Tool")
+	if not tool then
+		local backpack = s.player:FindFirstChildOfClass("Backpack")
+		local first = backpack and backpack:FindFirstChildOfClass("Tool")
+		if first then hum:EquipTool(first) end
+		return
+	end
+
+	s.lastAttack = now
+	pcall(function() tool:Activate() end)
+
+	local remote = tool:FindFirstChild("RemoteEvent") or tool:FindFirstChild("Fire")
+	if remote and remote:IsA("RemoteEvent") then
+		pcall(function() remote:FireServer() end)
+	end
+end
+
+----------------------------------------------------------------
+-- API pública
+----------------------------------------------------------------
+function Autofarm.enable(player, distanceFn, options)
+	Autofarm.disable()
+
+	local opts = table.clone(DEFAULTS)
+	if options then
+		for k, v in pairs(options) do opts[k] = v end
+	end
+
+	state = {
+		player     = player,
+		distanceFn = distanceFn or function() return 3 end,
+		opts       = opts,
+		target     = nil,
+		radius     = 0,
+		lastAttack = 0,
+		lastScan   = 0,
+	}
+
+	RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Camera.Value - 1, follow)
+	state.attackConn = RunService.Heartbeat:Connect(attack)
 end
 
 function Autofarm.disable()
-	active = false
-	for _, c in ipairs(conns) do c:Disconnect() end
-	conns = {}
-	for _, c in pairs(died) do c:Disconnect() end
-	for _, c in pairs(hconns) do c:Disconnect() end
-	died, npcs, ignoredUntil, hconns, lastDamage, trackState = {}, {}, {}, {}, {}, {}
-	noTarget, targetSince = 0, 0
-	lastUserInput = 0
-	target, orbitTarget, onStopCb = nil, nil, nil
-	attackTimer, searchTimer, pollTimer, dodgeUntil = 0, 0, 0, 0
-	unlockCamera()
+	if not state then return end
+
+	pcall(function() RunService:UnbindFromRenderStep(STEP_NAME) end)
+	if state.attackConn then state.attackConn:Disconnect() end
+
+	local char = state.player.Character
+	local hum  = char and char:FindFirstChildOfClass("Humanoid")
+	if hum and state.prevAutoRotate ~= nil then
+		hum.AutoRotate = state.prevAutoRotate
+	end
+
+	state = nil
 end
 
 return Autofarm
