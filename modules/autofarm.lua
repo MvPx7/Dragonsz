@@ -1,6 +1,7 @@
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
 
 local Autofarm = {}
 
@@ -29,6 +30,11 @@ local DEAD_IGNORE = 4          -- segundos que um NPC morto é ignorado (evita b
 local REACTION_WINDOW = 0.25  -- animação que começa até X s depois do NPC levar dano = reação ao seu golpe, NÃO ataque
 local STUCK_SECONDS = 7        -- sem causar dano por X segundos: larga o alvo (evita ficar travado num NPC inalcançável)
 local STUCK_IGNORE  = 3        -- e ignora esse NPC por X segundos
+-- Proteção do clique: o clique simulado vai para onde o mouse está, então ele NÃO clica quando:
+--   * o mouse está sobre um menu/botão, ou o menu do Roblox está aberto, ou você está digitando
+--   * você mexeu o mouse ou apertou uma tecla nos últimos USER_PAUSE segundos
+local SAFE_CLICK = true
+local USER_PAUSE = 1.5
 local DEBUG       = false      -- true = mostra no console as animações do NPC (ajuda a calibrar a esquiva)
 
 local okVim, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
@@ -53,6 +59,7 @@ local lastDamage = {}  -- [model] = quando o NPC levou dano pela última vez
 local hconns = {}      -- [model] = conexão do HealthChanged
 local trackState = {}  -- [animação] = "attack" | "reaction"
 local targetSince, noTarget = 0, 0
+local lastUserInput, lastBlockMsg = 0, 0
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 local target, orbitTarget = nil, nil
@@ -170,6 +177,35 @@ local function clickM1()
 	end
 end
 
+-- O mouse está sobre um botão/menu da tela?
+local function overInteractiveGui(pos)
+	local lp = Players.LocalPlayer
+	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
+	if not pg then return false end
+	local inset = GuiService:GetGuiInset()
+	local ok, objs = pcall(function() return pg:GetGuiObjectsAtPosition(pos.X, pos.Y - inset.Y) end)
+	if not ok then return false end
+	for _, o in ipairs(objs) do
+		if o:IsA("GuiButton") or o.Active then return true end
+	end
+	return false
+end
+
+-- Pode clicar agora sem atrapalhar o que você está fazendo?
+local function canClick()
+	if not SAFE_CLICK then return true end
+	local reason
+	if GuiService.MenuIsOpen then reason = "menu do Roblox aberto"
+	elseif UIS:GetFocusedTextBox() then reason = "você está digitando"
+	elseif os.clock() - lastUserInput < USER_PAUSE then reason = "você está usando o mouse/teclado"
+	elseif overInteractiveGui(UIS:GetMouseLocation()) then reason = "mouse sobre um menu" end
+	if reason and DEBUG and os.clock() - lastBlockMsg > 2 then
+		lastBlockMsg = os.clock()
+		print("[Dragonsz DEBUG] clique pausado: " .. reason)
+	end
+	return reason == nil
+end
+
 local function attack(char)
 	if ATTACK_MODE == "auto" then
 		local tool = char:FindFirstChildOfClass("Tool")
@@ -181,7 +217,7 @@ local function attack(char)
 			end
 		end
 	end
-	pcall(clickM1)
+	if canClick() then pcall(clickM1) end
 end
 
 local function startOrbit(hrp, nHrp)
@@ -257,6 +293,16 @@ function Autofarm.enable(player, distanceFn, onStop)
 	if myHum then
 		conns[#conns + 1] = myHum.Died:Connect(function() stop("você morreu") end)
 	end
+
+	-- Detecta quando VOCÊ está usando o mouse ou o teclado (para pausar os cliques)
+	conns[#conns + 1] = UIS.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement and input.Delta.Magnitude > 2 then
+			lastUserInput = os.clock()
+		end
+	end)
+	conns[#conns + 1] = UIS.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Keyboard then lastUserInput = os.clock() end
+	end)
 
 	lockCamera(player)
 
@@ -359,6 +405,7 @@ function Autofarm.disable()
 	for _, c in pairs(hconns) do c:Disconnect() end
 	died, npcs, ignoredUntil, hconns, lastDamage, trackState = {}, {}, {}, {}, {}, {}
 	noTarget, targetSince = 0, 0
+	lastUserInput = 0
 	target, orbitTarget, onStopCb = nil, nil, nil
 	attackTimer, searchTimer, pollTimer, dodgeUntil = 0, 0, 0, 0
 	unlockCamera()
