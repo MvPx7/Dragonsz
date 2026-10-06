@@ -12,10 +12,12 @@ local FLIP_MIN        = 1.5    -- o sentido da volta inverte sozinho a cada FLIP
 local FLIP_MAX        = 3
 local ATTACK_MODE     = "auto" -- "auto": usa o evento da ferramenta se existir, senão clica (M1) | "click": sempre clica
 
--- Esquiva: quando o NPC começa uma animação de ataque, o jogador recua para fora do alcance
+-- Esquiva: quando o NPC começa uma animação de ataque, o jogador sai da frente dele
 local DODGE_ENABLED = true
-local SAFE_RADIUS   = 22       -- distância (studs) para onde recua ao detectar um ataque
-local DODGE_HOLD    = 0.7      -- segundos que fica longe depois de detectar o ataque
+local DODGE_STYLE   = "behind" -- "behind": vai para as COSTAS do NPC e continua batendo (rápido)
+                               -- "away": recua para longe e não bate durante a esquiva (mais seguro, mais lento)
+local SAFE_RADIUS   = 12       -- só no estilo "away": distância do recuo
+local DODGE_HOLD    = 1.2      -- tempo MÁXIMO da esquiva; ela termina antes, assim que a animação do NPC acaba
 local DODGE_POLL    = 0.05     -- de quanto em quanto tempo verifica se o NPC está atacando
 
 -- Mira fixa: a câmera fica travada olhando para o NPC (o mouse/câmera não "balançam" mais)
@@ -116,10 +118,14 @@ local function isAttacking(hum)
 			for _, w in ipairs(IGNORE_NAMES) do
 				if n:find(w, 1, true) then skip = true; break end
 			end
-			if not skip then return true end
+			if not skip then
+				local remaining = track.Length - track.TimePosition -- quanto falta para o golpe terminar
+				if remaining <= 0 then remaining = 0.4 end
+				return true, remaining
+			end
 		end
 	end
-	return false
+	return false, 0
 end
 
 -- Clique M1 no lugar onde o mouse já está (o cursor não se mexe)
@@ -254,7 +260,8 @@ function Autofarm.enable(player, distanceFn, onStop)
 			pollTimer = pollTimer + dt
 			if pollTimer >= DODGE_POLL then
 				pollTimer = 0
-				if isAttacking(npcs[target]) then dodgeUntil = os.clock() + DODGE_HOLD end
+				local atk, remaining = isAttacking(npcs[target])
+				if atk then dodgeUntil = os.clock() + math.min(remaining + 0.1, DODGE_HOLD) end
 			end
 		end
 		local dodging = os.clock() < dodgeUntil
@@ -267,18 +274,29 @@ function Autofarm.enable(player, distanceFn, onStop)
 			flipLeft = FLIP_MIN + math.random() * (FLIP_MAX - FLIP_MIN)
 		end
 		local radius = distanceFn()
-		if dodging then radius = math.max(radius, SAFE_RADIUS) end
 		local c = nHrp.Position
-		local pos = Vector3.new(c.X + math.cos(angle) * radius, c.Y, c.Z + math.sin(angle) * radius)
+		local pos
+		if dodging and DODGE_STYLE == "behind" then
+			-- Costas do NPC, na mesma distância de sempre (continua ao alcance do seu ataque)
+			local look = nHrp.CFrame.LookVector
+			look = Vector3.new(look.X, 0, look.Z)
+			if look.Magnitude < 0.1 then look = Vector3.new(0, 0, 1) end
+			look = look.Unit
+			pos = Vector3.new(c.X - look.X * radius, c.Y, c.Z - look.Z * radius)
+			angle = math.atan2(pos.Z - c.Z, pos.X - c.X) -- a volta continua daqui, sem pular de volta
+		else
+			if dodging then radius = math.max(radius, SAFE_RADIUS) end
+			pos = Vector3.new(c.X + math.cos(angle) * radius, c.Y, c.Z + math.sin(angle) * radius)
+		end
 		hrp.CFrame = CFrame.new(pos, Vector3.new(c.X, pos.Y, c.Z))
 		hrp.AssemblyLinearVelocity = Vector3.zero
 
-		-- Ataca (nunca durante a esquiva, nunca em NPC morto)
+		-- Ataca (no estilo "away" não bate durante a esquiva; nunca bate em NPC morto)
 		attackTimer = attackTimer + dt
 		if attackTimer >= ATTACK_INTERVAL then
 			attackTimer = 0
 			local nh = npcs[target]
-			if not dodging and nh and usable(target, nh) then attack(char) end
+			if (not dodging or DODGE_STYLE == "behind") and nh and usable(target, nh) then attack(char) end
 		end
 	end)
 end
