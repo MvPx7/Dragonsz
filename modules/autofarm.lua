@@ -35,6 +35,8 @@ local DEFAULTS = {
 	smoothing         = 20,      -- maior = segue mais rápido; menor = mais suave
 	retargetEvery     = 0.5,     -- segundos entre buscas de alvo
 	reachPadding      = 1.5,     -- tolerância extra do alcance (studs)
+	requireRange      = false,   -- true = só ataca dentro do alcance estimado (false = ataca sempre)
+	stuckTimeout      = 8,       -- segundos sem o NPC perder vida => ignora ele e troca de alvo (0 = desliga)
 	heightOffset      = 0,       -- ajuste de altura em relação ao NPC
 }
 
@@ -68,6 +70,7 @@ end
 local function isNPC(model, myChar)
 	if not model:IsA("Model") or model == myChar then return false end
 	if Players:GetPlayerFromCharacter(model) then return false end
+	if state and state.ignored[model] and os.clock() < state.ignored[model] then return false end
 	return isAlive(model)
 end
 
@@ -152,6 +155,9 @@ local function setTarget(s, npc)
 	if not npc then return end
 
 	s.radius = getRadius(npc)
+	local h0 = npc:FindFirstChildOfClass("Humanoid")
+	s.lastHealth = h0 and h0.Health or 0
+	s.lastProgress = os.clock()
 	log(s, "novo alvo:", npc.Name, "| raio:", string.format("%.1f", s.radius), "|", describeNpc(npc))
 
 	local hum = npc:FindFirstChildOfClass("Humanoid")
@@ -234,6 +240,20 @@ local function follow(dt)
 	if s.target and not isAlive(s.target) then
 		local stillInGame = s.target:IsDescendantOf(workspace)
 		dropTarget(s, s.target, stillInGame, "checagem de vida")
+	end
+
+	-- Alvo que não perde vida há muito tempo (travado/invulnerável): ignora por 15s e troca
+	if s.target and s.opts.stuckTimeout > 0 then
+		local th = s.target:FindFirstChildOfClass("Humanoid")
+		if th then
+			local t = os.clock()
+			if th.Health < s.lastHealth - 0.01 then s.lastProgress = t end
+			s.lastHealth = th.Health
+			if t - s.lastProgress > s.opts.stuckTimeout then
+				s.ignored[s.target] = t + 15
+				dropTarget(s, s.target, false, "sem perder vida há " .. s.opts.stuckTimeout .. "s (ignorado por 15s)")
+			end
+		end
 	end
 
 	-- Sem alvo: procura o mais próximo
@@ -362,7 +382,7 @@ local function attack()
 	local flat = Vector3.new(hrp.Position.X - nPos.X, 0, hrp.Position.Z - nPos.Z).Magnitude
 	if flat > getReach(s) then
 		s.outOfRange += 1
-		return
+		if s.opts.requireRange then return end
 	end
 
 	-- Sem ferramenta na mão: tenta equipar (no máximo 1x por segundo, sem travar o ataque)
@@ -411,7 +431,14 @@ function Autofarm.enable(player, distanceFn, options)
 		outOfRange    = 0,
 		toolActivated = 0,
 		uisClicks     = 0,
+		ignored       = {},
+		lastHealth    = 0,
+		lastProgress  = 0,
 	}
+
+	if type(mouse1click) ~= "function" and (opts.attackMode == "auto" or opts.attackMode == "native") and not opts.clickFn then
+		warn("[Autofarm] mouse1click não existe neste ambiente: o clique automático pode não funcionar.")
+	end
 
 	if opts.captureController then
 		pcall(function() VirtualUser:CaptureController() end)
