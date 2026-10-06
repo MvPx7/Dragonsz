@@ -26,6 +26,9 @@ local CAM_BACK    = 7          -- distância da câmera atrás do jogador
 local CAM_HEIGHT  = 5          -- altura da câmera
 
 local DEAD_IGNORE = 4          -- segundos que um NPC morto é ignorado (evita bater no corpo)
+local REACTION_WINDOW = 0.25  -- animação que começa até X s depois do NPC levar dano = reação ao seu golpe, NÃO ataque
+local STUCK_SECONDS = 7        -- sem causar dano por X segundos: larga o alvo (evita ficar travado num NPC inalcançável)
+local STUCK_IGNORE  = 3        -- e ignora esse NPC por X segundos
 local DEBUG       = false      -- true = mostra no console as animações do NPC (ajuda a calibrar a esquiva)
 
 local okVim, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
@@ -37,7 +40,8 @@ for _, name in ipairs({ "Action", "Action2", "Action3", "Action4" }) do
 	local ok, p = pcall(function() return Enum.AnimationPriority[name] end)
 	if ok and p then ACTION[p] = true end
 end
-local IGNORE_NAMES = { "idle", "walk", "run", "jump", "fall", "climb", "swim", "sit", "emote", "dance" }
+local IGNORE_NAMES = { "idle", "walk", "run", "jump", "fall", "climb", "swim", "sit", "emote", "dance",
+	"hurt", "damage", "stun", "stagger", "flinch", "react", "knock", "dead", "death", "spawn", "taunt" }
 
 local active = false
 local conns = {}       -- todas as conexões, para desligar tudo de uma vez
@@ -45,6 +49,12 @@ local npcs = {}        -- [model] = humanoid (lista em cache, mantida por evento
 local died = {}        -- [model] = conexão do evento Died
 local ignoredUntil = {} -- [model] = os.clock() até quando ignorar
 local seenAnims = {}
+local lastDamage = {}  -- [model] = quando o NPC levou dano pela última vez
+local hconns = {}      -- [model] = conexão do HealthChanged
+local trackState = {}  -- [animação] = "attack" | "reaction"
+local targetSince, noTarget = 0, 0
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
 local target, orbitTarget = nil, nil
 local angle, orbitDir, flipLeft = 0, 1, 2
 local attackTimer, searchTimer, pollTimer, dodgeUntil = 0, 0, 0, 0
@@ -72,6 +82,12 @@ local function register(hum)
 	npcs[model] = hum
 	if died[model] then died[model]:Disconnect() end
 	died[model] = hum.Died:Connect(function() markDead(model) end) -- reage na hora, sem esperar o próximo frame
+	if hconns[model] then hconns[model]:Disconnect() end
+	local lastHp = hum.Health
+	hconns[model] = hum.HealthChanged:Connect(function(h)
+		if h < lastHp then lastDamage[model] = os.clock() end -- anota quando o NPC leva dano
+		lastHp = h
+	end)
 end
 
 local function unregister(model)
@@ -79,6 +95,8 @@ local function unregister(model)
 	npcs[model] = nil
 	ignoredUntil[model] = nil
 	if died[model] then died[model]:Disconnect(); died[model] = nil end
+	if hconns[model] then hconns[model]:Disconnect(); hconns[model] = nil end
+	lastDamage[model] = nil
 	if target == model then target = nil end
 end
 
@@ -99,10 +117,11 @@ local function pickTarget(hrp)
 	return best
 end
 
--- O NPC está tocando uma animação de ataque?
-local function isAttacking(hum)
+-- O NPC está tocando uma animação de ataque? (ignora as reações ao dano que o próprio jogador causa)
+local function isAttacking(model, hum)
 	local animator = hum:FindFirstChildOfClass("Animator")
-	if not animator then return false end
+	if not animator then return false, 0 end
+	local playing, result, remaining = {}, false, 0
 	for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
 		if DEBUG then
 			local key = track.Name .. "|" .. tostring(track.Priority)
@@ -113,19 +132,31 @@ local function isAttacking(hum)
 			end
 		end
 		if track.IsPlaying and not track.Looped and track.WeightCurrent > 0.1 and ACTION[track.Priority] then
-			local n = track.Name:lower()
-			local skip = false
-			for _, w in ipairs(IGNORE_NAMES) do
-				if n:find(w, 1, true) then skip = true; break end
+			playing[track] = true
+			if not trackState[track] then
+				-- Primeira vez que vemos essa animação tocar: começou logo depois de o NPC levar dano? Então é reação.
+				trackState[track] = (os.clock() - (lastDamage[model] or 0) < REACTION_WINDOW) and "reaction" or "attack"
+				if DEBUG then print(string.format("[Dragonsz DEBUG] '%s' classificada como: %s", track.Name, trackState[track])) end
 			end
-			if not skip then
-				local remaining = track.Length - track.TimePosition -- quanto falta para o golpe terminar
-				if remaining <= 0 then remaining = 0.4 end
-				return true, remaining
+			if trackState[track] == "attack" then
+				local n = track.Name:lower()
+				local skip = false
+				for _, w in ipairs(IGNORE_NAMES) do
+					if n:find(w, 1, true) then skip = true; break end
+				end
+				if not skip then
+					local rem = track.Length - track.TimePosition -- quanto falta para o golpe terminar
+					if rem <= 0 then rem = 0.4 end
+					result = true
+					if rem > remaining then remaining = rem end
+				end
 			end
 		end
 	end
-	return false, 0
+	for tr in pairs(trackState) do
+		if not playing[tr] then trackState[tr] = nil end -- animação terminou: esquece
+	end
+	return result, remaining
 end
 
 -- Clique M1 no lugar onde o mouse já está (o cursor não se mexe)
@@ -242,11 +273,23 @@ function Autofarm.enable(player, distanceFn, onStop)
 			if not nh or not usable(target, nh) or not rootOf(target) then target = nil end
 		end
 		if not target then
+			noTarget = noTarget + dt
+			if noTarget > 0.6 then unlockCamera() end -- sem alvo: devolve a câmera ao normal
 			searchTimer = searchTimer + dt
 			if searchTimer < SEARCH_INTERVAL then return end
 			searchTimer = 0
 			target = pickTarget(hrp)
 			if not target then return end
+			noTarget, targetSince = 0, os.clock()
+			lockCamera(player)
+		end
+
+		-- Muito tempo sem causar dano (NPC inalcançável ou invulnerável)? Larga o alvo para não ficar travado
+		if os.clock() - math.max(targetSince, lastDamage[target] or 0) > STUCK_SECONDS then
+			ignoredUntil[target] = os.clock() + STUCK_IGNORE
+			print("[Dragonsz Autofarm] " .. STUCK_SECONDS .. "s sem causar dano, trocando de alvo")
+			target = nil
+			return
 		end
 
 		local nHrp = rootOf(target)
@@ -260,7 +303,7 @@ function Autofarm.enable(player, distanceFn, onStop)
 			pollTimer = pollTimer + dt
 			if pollTimer >= DODGE_POLL then
 				pollTimer = 0
-				local atk, remaining = isAttacking(npcs[target])
+				local atk, remaining = isAttacking(target, npcs[target])
 				if atk then dodgeUntil = os.clock() + math.min(remaining + 0.1, DODGE_HOLD) end
 			end
 		end
@@ -288,6 +331,13 @@ function Autofarm.enable(player, distanceFn, onStop)
 			if dodging then radius = math.max(radius, SAFE_RADIUS) end
 			pos = Vector3.new(c.X + math.cos(angle) * radius, c.Y, c.Z + math.sin(angle) * radius)
 		end
+		-- Fica sempre no chão (se o NPC for lançado ao ar, o jogador não flutua junto)
+		rayParams.FilterDescendantsInstances = { char, target }
+		local ground = workspace:Raycast(Vector3.new(pos.X, c.Y + 4, pos.Z), Vector3.new(0, -300, 0), rayParams)
+		if ground then
+			local stand = (hum and hum.HipHeight or 2) + hrp.Size.Y / 2
+			pos = Vector3.new(pos.X, math.min(c.Y, ground.Position.Y + stand), pos.Z)
+		end
 		hrp.CFrame = CFrame.new(pos, Vector3.new(c.X, pos.Y, c.Z))
 		hrp.AssemblyLinearVelocity = Vector3.zero
 
@@ -306,7 +356,9 @@ function Autofarm.disable()
 	for _, c in ipairs(conns) do c:Disconnect() end
 	conns = {}
 	for _, c in pairs(died) do c:Disconnect() end
-	died, npcs, ignoredUntil = {}, {}, {}
+	for _, c in pairs(hconns) do c:Disconnect() end
+	died, npcs, ignoredUntil, hconns, lastDamage, trackState = {}, {}, {}, {}, {}, {}
+	noTarget, targetSince = 0, 0
 	target, orbitTarget, onStopCb = nil, nil, nil
 	attackTimer, searchTimer, pollTimer, dodgeUntil = 0, 0, 0, 0
 	unlockCamera()
