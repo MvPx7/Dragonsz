@@ -1,6 +1,6 @@
 -- modules/autofarm.lua
 -- Segue o NPC mais próximo, mantém o personagem MIRANDO nele (mesmo com Trava Shift),
--- ataca sozinho e detecta quando o NPC morre para pegar o próximo.
+-- ataca sozinho, detecta quando o NPC morre e troca de alvo.
 --
 -- Uso:
 --   Autofarm.enable(player, distanceFn)            -- distanceFn() = folga em studs entre os corpos
@@ -8,13 +8,17 @@
 --   Autofarm.disable()
 --   Autofarm.getKills()
 --
+-- Teclas (enquanto ligado):
+--   RightControl = pausa / retoma TUDO (movimento + cliques). Use ao abrir menus.
+--   F7           = imprime no Output os dados do NPC mais próximo (para diagnosticar a morte)
+--
 -- Diagnóstico: Autofarm.enable(player, distanceFn, { debug = true })
--- e olhe as linhas [Autofarm] no Output / Console (F9).
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local VirtualUser = game:GetService("VirtualUser")
 local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
 
 local Autofarm = {}
 
@@ -28,15 +32,19 @@ local DEFAULTS = {
 	attackInterval    = 0.15,    -- segundos entre ataques
 	attackMode        = "auto",  -- "auto" | "native" | "click" | "hold" | "tool"
 	clickFn           = nil,     -- função própria de ataque (substitui attackMode)
-	isDeadFn          = nil,     -- função(npc) -> true se o NPC está morto (jogos com vida própria)
+	isDeadFn          = nil,     -- função(npc) -> true se o NPC está morto
 	onKill            = nil,     -- função(npc, totalMortes) chamada quando o alvo morre
+	safeClick         = true,    -- NÃO clica com menu aberto / mouse sobre botão / janela sem foco
+	useBarDetection   = true,    -- detecta morte pela barra de vida do NPC chegando a zero
+	pauseKey          = Enum.KeyCode.RightControl,
+	dumpKey           = Enum.KeyCode.F7,
 	captureController = false,   -- chama VirtualUser:CaptureController() ao ligar
 	debug             = false,   -- imprime diagnóstico no Output
 	smoothing         = 20,      -- maior = segue mais rápido; menor = mais suave
 	retargetEvery     = 0.5,     -- segundos entre buscas de alvo
 	reachPadding      = 1.5,     -- tolerância extra do alcance (studs)
-	requireRange      = false,   -- true = só ataca dentro do alcance estimado (false = ataca sempre)
-	stuckTimeout      = 8,       -- segundos sem o NPC perder vida => ignora ele e troca de alvo (0 = desliga)
+	requireRange      = false,   -- true = só ataca dentro do alcance estimado
+	stuckTimeout      = 8,       -- segundos sem o NPC perder vida => ignora e troca de alvo (0 = desliga)
 	heightOffset      = 0,       -- ajuste de altura em relação ao NPC
 }
 
@@ -49,17 +57,92 @@ local function log(s, ...)
 end
 
 ----------------------------------------------------------------
--- Utilidades
+-- Detecção de morte (vários sinais, porque cada jogo faz de um jeito)
 ----------------------------------------------------------------
+local DEAD_FLAGS = { dead = true, isdead = true, died = true, dying = true, isdying = true }
+local HP_NAMES = {
+	health = true, hp = true, currenthealth = true, currenthp = true, curhealth = true, curhp = true,
+}
+
 local function getRoot(model)
 	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
 end
 
+-- Atributos / valores do modelo dizendo que morreu
+local function dataSaysDead(npc)
+	local hum = npc:FindFirstChildOfClass("Humanoid")
+	local holders = { npc }
+	if hum then table.insert(holders, hum) end
+
+	for _, h in ipairs(holders) do
+		for k, v in pairs(h:GetAttributes()) do
+			local key = string.lower(tostring(k))
+			if DEAD_FLAGS[key] and v == true then return "atributo " .. tostring(k) .. " = true" end
+			if HP_NAMES[key] and type(v) == "number" and v <= 0 then return "atributo " .. tostring(k) .. " <= 0" end
+		end
+	end
+
+	for _, c in ipairs(npc:GetChildren()) do
+		if c:IsA("ValueBase") then
+			local key = string.lower(c.Name)
+			if DEAD_FLAGS[key] and c.Value == true then return "valor " .. c.Name .. " = true" end
+			if HP_NAMES[key] and type(c.Value) == "number" and c.Value <= 0 then return "valor " .. c.Name .. " <= 0" end
+		end
+	end
+	return nil
+end
+
+-- Barras (GuiObjects) do NPC que começaram com largura > 0: se zerarem, o NPC morreu
+local function collectBars(npc)
+	local bars = {}
+	for _, d in ipairs(npc:GetDescendants()) do
+		if #bars >= 60 then break end
+		if d:IsA("GuiObject") and not (d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox")) then
+			if d.Size.X.Scale >= 0.05 then
+				table.insert(bars, d)
+			end
+		end
+	end
+	return bars
+end
+
+-- Retorna o motivo da morte (string) ou nil se está vivo
+local function deathReason(s, npc)
+	if not npc:IsDescendantOf(workspace) then return nil end
+
+	local hum = npc:FindFirstChildOfClass("Humanoid")
+	if not hum then return "Humanoid removido" end
+	if hum.Health <= 0 then return "Humanoid.Health <= 0" end
+	if hum:GetState() == Enum.HumanoidStateType.Dead then return "estado Dead" end
+
+	local d = dataSaysDead(npc)
+	if d then return d end
+
+	if s.opts.useBarDetection then
+		for _, b in ipairs(s.bars) do
+			if b.Parent and b.Size.X.Scale <= 0.01 and b.Size.X.Offset <= 1 then
+				return "barra de vida zerada: " .. b:GetFullName()
+			end
+		end
+	end
+
+	if s.opts.isDeadFn then
+		local ok, dead = pcall(s.opts.isDeadFn, npc)
+		if ok and dead then return "isDeadFn" end
+	end
+	return nil
+end
+
+-- Versão leve usada na busca de alvos
 local function isAlive(npc)
 	if not npc or not npc.Parent or not npc:IsDescendantOf(workspace) then return false end
+	if state and state.dead[npc] and os.clock() < state.dead[npc] then return false end
+
 	local hum = npc:FindFirstChildOfClass("Humanoid")
 	if not hum or getRoot(npc) == nil then return false end
 	if hum.Health <= 0 or hum:GetState() == Enum.HumanoidStateType.Dead then return false end
+	if dataSaysDead(npc) then return false end
+
 	if state and state.opts.isDeadFn then
 		local ok, dead = pcall(state.opts.isDeadFn, npc)
 		if ok and dead then return false end
@@ -67,6 +150,9 @@ local function isAlive(npc)
 	return true
 end
 
+----------------------------------------------------------------
+-- Utilidades
+----------------------------------------------------------------
 local function isNPC(model, myChar)
 	if not model:IsA("Model") or model == myChar then return false end
 	if Players:GetPlayerFromCharacter(model) then return false end
@@ -108,7 +194,41 @@ local function aimAtTarget(s, hrp)
 end
 
 ----------------------------------------------------------------
--- Alvo e detecção de morte
+-- Segurança do clique (evita clicar em menus)
+----------------------------------------------------------------
+local function cursorOverUi(s)
+	local pg = s.player:FindFirstChildOfClass("PlayerGui")
+	if not pg then return false end
+
+	local loc = UserInputService:GetMouseLocation()
+	local inset = GuiService:GetGuiInset()
+	local positions = { loc - inset, loc }
+
+	for _, pos in ipairs(positions) do
+		for _, obj in ipairs(pg:GetGuiObjectsAtPosition(pos.X, pos.Y)) do
+			if obj:IsA("GuiButton") then
+				return true
+			end
+			-- painéis de menu costumam ser Frames "Active" com fundo visível
+			if obj.Active and obj.BackgroundTransparency < 0.95 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- true = pode clicar. Retorna também o motivo quando não pode.
+local function safeToClick(s)
+	if not s.focused then return false, "janela sem foco" end
+	if GuiService.MenuIsOpen then return false, "menu do Roblox aberto" end
+	if UserInputService:GetFocusedTextBox() then return false, "digitando em caixa de texto" end
+	if cursorOverUi(s) then return false, "mouse sobre botão/menu" end
+	return true
+end
+
+----------------------------------------------------------------
+-- Alvo
 ----------------------------------------------------------------
 local function clearTargetConns(s)
 	for _, c in ipairs(s.targetConns) do c:Disconnect() end
@@ -120,6 +240,7 @@ local function dropTarget(s, npc, killed, reason)
 	if s.target ~= npc then return end -- evita contar duas vezes
 	clearTargetConns(s)
 	s.target = nil
+	s.bars = {}
 	s.lastScan = 0 -- procura o próximo alvo imediatamente
 
 	log(s, "alvo solto:", npc.Name, "| motivo:", reason or "?", "| kill:", killed)
@@ -155,14 +276,16 @@ local function setTarget(s, npc)
 	if not npc then return end
 
 	s.radius = getRadius(npc)
+	s.bars = collectBars(npc)
 	local h0 = npc:FindFirstChildOfClass("Humanoid")
 	s.lastHealth = h0 and h0.Health or 0
 	s.lastProgress = os.clock()
-	log(s, "novo alvo:", npc.Name, "| raio:", string.format("%.1f", s.radius), "|", describeNpc(npc))
+	log(s, "novo alvo:", npc.Name, "| raio:", string.format("%.1f", s.radius), "| barras:", #s.bars, "|", describeNpc(npc))
 
 	local hum = npc:FindFirstChildOfClass("Humanoid")
 	if hum then
 		table.insert(s.targetConns, hum.Died:Connect(function()
+			s.dead[npc] = os.clock() + 60
 			dropTarget(s, npc, true, "Humanoid.Died")
 		end))
 	end
@@ -170,6 +293,55 @@ local function setTarget(s, npc)
 	table.insert(s.targetConns, npc.AncestryChanged:Connect(function(_, parent)
 		if not parent then dropTarget(s, npc, false, "removido do jogo") end
 	end))
+end
+
+----------------------------------------------------------------
+-- Dump de dados do NPC (tecla F7)
+----------------------------------------------------------------
+local function dumpModel(npc, label)
+	print("[Autofarm][DUMP]", label, npc:GetFullName())
+	local hum = npc:FindFirstChildOfClass("Humanoid")
+	if hum then
+		print("   Humanoid:", string.format("Health=%.2f Max=%.2f Estado=%s", hum.Health, hum.MaxHealth, hum:GetState().Name))
+		for k, v in pairs(hum:GetAttributes()) do print("   attr(Humanoid)", k, v) end
+	else
+		print("   Humanoid: nenhum")
+	end
+	for k, v in pairs(npc:GetAttributes()) do print("   attr", k, v) end
+	for _, c in ipairs(npc:GetChildren()) do
+		if c:IsA("ValueBase") then print("   valor", c.ClassName, c.Name, c.Value) end
+	end
+	local root = getRoot(npc)
+	if root then
+		print("   Raiz:", root.Name, "Anchored=", root.Anchored, "Transparency=", root.Transparency, "CanCollide=", root.CanCollide)
+	end
+	local n = 0
+	for _, d in ipairs(npc:GetDescendants()) do
+		if d:IsA("GuiObject") and n < 40 then
+			n += 1
+			local extra = d:IsA("TextLabel") and (" texto=" .. d.Text) or ""
+			print("   gui", d.ClassName, d:GetFullName(), "Size.X=", d.Size.X.Scale, d.Size.X.Offset, "Visible=", d.Visible, extra)
+		end
+	end
+end
+
+local function dumpNearest(s)
+	local char = s.player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local nearest, nearestDist = nil, math.huge
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("Model") and obj ~= char and not Players:GetPlayerFromCharacter(obj)
+			and obj:FindFirstChildOfClass("Humanoid") and getRoot(obj) then
+			local d = (hrp.Position - getRoot(obj).Position).Magnitude
+			if d < nearestDist then nearest, nearestDist = obj, d end
+		end
+	end
+
+	if nearest then dumpModel(nearest, "NPC mais próximo (inclui mortos)") end
+	if s.target and s.target ~= nearest then dumpModel(s.target, "alvo atual") end
+	print("[Autofarm][DUMP] fim")
 end
 
 ----------------------------------------------------------------
@@ -210,14 +382,14 @@ local function debugTick(s, char, hrp)
 	local hum = npc:FindFirstChildOfClass("Humanoid")
 
 	log(s, string.format(
-		"alvo=%s vida=%s dist=%.1f alcance=%.1f mira_erro=%.0f° ferramenta=%s | por segundo: ataques=%d fora_alcance=%d Tool.Activated=%d M1_no_UIS=%d | kills=%d",
+		"alvo=%s vida=%s dist=%.1f alcance=%.1f mira_erro=%.0f° | por segundo: ataques=%d bloqueados=%d fora_alcance=%d | kills=%d%s",
 		npc.Name,
 		hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "sem humanoid",
 		toNpc.Magnitude, getReach(s), aimErr,
-		tool and tool.Name or "nenhuma",
-		s.swings, s.outOfRange, s.toolActivated, s.uisClicks, s.kills
+		s.swings, s.blocked, s.outOfRange, s.kills,
+		s.paused and " | PAUSADO" or ""
 	))
-	s.swings, s.outOfRange, s.toolActivated, s.uisClicks = 0, 0, 0, 0
+	s.swings, s.outOfRange, s.toolActivated, s.uisClicks, s.blocked = 0, 0, 0, 0, 0
 end
 
 ----------------------------------------------------------------
@@ -232,14 +404,32 @@ local function follow(dt)
 	local hum  = char and char:FindFirstChildOfClass("Humanoid")
 	if not hrp or not hum or hum.Health <= 0 then return end
 
+	-- Pausado: devolve o controle ao jogador
+	if s.paused then
+		if s.prevAutoRotate ~= nil then
+			hum.AutoRotate = s.prevAutoRotate
+			s.prevAutoRotate = nil
+		end
+		return
+	end
+
 	-- Impede o personagem de girar sozinho
 	if s.prevAutoRotate == nil then s.prevAutoRotate = hum.AutoRotate end
 	hum.AutoRotate = false
 
-	-- Garantia: se o alvo morreu/sumiu e o evento não chegou, solta agora
-	if s.target and not isAlive(s.target) then
-		local stillInGame = s.target:IsDescendantOf(workspace)
-		dropTarget(s, s.target, stillInGame, "checagem de vida")
+	-- Alvo removido do jogo
+	if s.target and not s.target:IsDescendantOf(workspace) then
+		dropTarget(s, s.target, false, "removido do jogo")
+	end
+
+	-- Alvo morreu? (vários sinais)
+	if s.target then
+		local reason = deathReason(s, s.target)
+		if reason then
+			local npc = s.target
+			s.dead[npc] = os.clock() + 60 -- não volta a escolher o cadáver
+			dropTarget(s, npc, true, reason)
+		end
 	end
 
 	-- Alvo que não perde vida há muito tempo (travado/invulnerável): ignora por 15s e troca
@@ -310,7 +500,7 @@ end
 -- então reaplicamos a mira no NPC logo depois. A câmera não é alterada.
 local function aim()
 	local s = state
-	if not s or not s.opts.lockAim or not s.target then return end
+	if not s or s.paused or not s.opts.lockAim or not s.target then return end
 	local char = s.player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if hrp then aimAtTarget(s, hrp) end
@@ -335,6 +525,17 @@ local function swing(s, char)
 	local useClick  = (mode == "click") or (mode == "auto" and not hasNative)
 	local useHold   = (mode == "hold")
 	local useTool   = (mode == "tool") or (mode == "auto")
+
+	-- Cliques de mouse acontecem onde o cursor está: só clica se for seguro
+	if useNative or useClick or useHold then
+		local ok, why = true, nil
+		if s.opts.safeClick then ok, why = safeToClick(s) end
+		if not ok then
+			s.blocked += 1
+			s.lastBlockReason = why
+			useNative, useClick, useHold = false, false, false
+		end
+	end
 
 	if useNative and hasNative then
 		pcall(mouse1click)
@@ -367,7 +568,7 @@ end
 
 local function attack()
 	local s = state
-	if not s or not isAlive(s.target) then return end
+	if not s or s.paused or not isAlive(s.target) then return end
 
 	local now = os.clock()
 	if now - s.lastAttack < s.opts.attackInterval then return end
@@ -377,7 +578,7 @@ local function attack()
 	local hum  = char and char:FindFirstChildOfClass("Humanoid")
 	if not hrp or not hum or hum.Health <= 0 then return end
 
-	-- Só ataca se estiver dentro do alcance
+	-- Alcance estimado
 	local nPos = getRoot(s.target).Position
 	local flat = Vector3.new(hrp.Position.X - nPos.X, 0, hrp.Position.Z - nPos.Z).Magnitude
 	if flat > getReach(s) then
@@ -396,7 +597,7 @@ local function attack()
 		end
 	end
 
-	-- Garante a mira no NPC no instante do golpe (depois da física, antes de enviar ao servidor)
+	-- Garante a mira no NPC no instante do golpe
 	if s.opts.lockAim then aimAtTarget(s, hrp) end
 
 	s.lastAttack = now
@@ -415,26 +616,33 @@ function Autofarm.enable(player, distanceFn, options)
 		for k, v in pairs(options) do opts[k] = v end
 	end
 
-	state = {
+	local s = {
 		player        = player,
 		distanceFn    = distanceFn or function() return 3 end,
 		opts          = opts,
 		target        = nil,
 		targetConns   = {},
+		conns         = {},
+		bars          = {},
+		dead          = {},
+		ignored       = {},
 		radius        = 0,
 		kills         = 0,
 		lastAttack    = 0,
 		lastScan      = 0,
 		lastEquip     = 0,
 		lastDebug     = 0,
+		lastHealth    = 0,
+		lastProgress  = 0,
 		swings        = 0,
+		blocked       = 0,
 		outOfRange    = 0,
 		toolActivated = 0,
 		uisClicks     = 0,
-		ignored       = {},
-		lastHealth    = 0,
-		lastProgress  = 0,
+		paused        = false,
+		focused       = true,
 	}
+	state = s
 
 	if type(mouse1click) ~= "function" and (opts.attackMode == "auto" or opts.attackMode == "native") and not opts.clickFn then
 		warn("[Autofarm] mouse1click não existe neste ambiente: o clique automático pode não funcionar.")
@@ -444,19 +652,29 @@ function Autofarm.enable(player, distanceFn, options)
 		pcall(function() VirtualUser:CaptureController() end)
 	end
 
-	if opts.debug then
-		-- Mostra se o clique simulado chega no UserInputService do jogo
-		state.uisConn = UserInputService.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton1 then
-				state.uisClicks += 1
-			end
-		end)
-		log(state, "ligado | attackMode =", opts.attackMode, "| mouse1click disponível =", type(mouse1click) == "function")
-	end
+	-- Foco da janela: nunca clica se o Roblox não estiver em foco
+	table.insert(s.conns, UserInputService.WindowFocused:Connect(function() s.focused = true end))
+	table.insert(s.conns, UserInputService.WindowFocusReleased:Connect(function() s.focused = false end))
+
+	-- Teclas de pausa e dump
+	table.insert(s.conns, UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if opts.debug and input.UserInputType == Enum.UserInputType.MouseButton1 then
+			s.uisClicks += 1
+		end
+		if gameProcessed then return end
+		if input.KeyCode == opts.pauseKey then
+			s.paused = not s.paused
+			print("[Autofarm]", s.paused and "PAUSADO (aperte RightControl de novo para retomar)" or "RETOMADO")
+		elseif input.KeyCode == opts.dumpKey then
+			dumpNearest(s)
+		end
+	end))
+
+	log(s, "ligado | attackMode =", opts.attackMode, "| mouse1click disponível =", type(mouse1click) == "function")
 
 	RunService:BindToRenderStep(MOVE_STEP, Enum.RenderPriority.Camera.Value - 1, follow)
 	RunService:BindToRenderStep(AIM_STEP, Enum.RenderPriority.Camera.Value + 1, aim)
-	state.attackConn = RunService.Heartbeat:Connect(attack)
+	s.attackConn = RunService.Heartbeat:Connect(attack)
 end
 
 function Autofarm.disable()
@@ -465,8 +683,8 @@ function Autofarm.disable()
 	pcall(function() RunService:UnbindFromRenderStep(MOVE_STEP) end)
 	pcall(function() RunService:UnbindFromRenderStep(AIM_STEP) end)
 	if state.attackConn then state.attackConn:Disconnect() end
-	if state.uisConn then state.uisConn:Disconnect() end
 	if state.toolConn then state.toolConn:Disconnect() end
+	for _, c in ipairs(state.conns) do c:Disconnect() end
 	clearTargetConns(state)
 
 	local char = state.player.Character
