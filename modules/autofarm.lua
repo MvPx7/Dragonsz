@@ -1,51 +1,89 @@
--- modules/autofarm.lua
--- Segue o NPC mais próximo, mantém o personagem MIRANDO nele (mesmo com Trava Shift),
--- ataca sozinho, detecta quando o NPC morre e troca de alvo.
+-- modules/autofarm.lua  (v2: anda de verdade até o NPC, sem teleporte)
+--
+-- O que faz:
+--   * Procura NPCs (todos, ou só os que você filtrar) e CAMINHA até a área deles usando
+--     pathfinding (desvia de paredes, pula obstáculos). Nada de teletransporte.
+--   * Perto do NPC: fica na distância certa da hitbox, mira nele (mesmo com Trava Shift)
+--     e ataca sozinho.
+--   * Desvia quando o NPC começa uma animação de ataque.
+--   * Se a vida ficar baixa, recua; volta quando recuperar.
+--   * Detecta a morte do NPC e vai para o próximo. Se não houver NPC (respawn), volta para a área.
 --
 -- Uso:
---   Autofarm.enable(player, distanceFn)            -- distanceFn() = folga em studs entre os corpos
---   Autofarm.enable(player, distanceFn, { ... })   -- opções (opcional)
+--   Autofarm.enable(player, distanceFn)
+--   Autofarm.enable(player, distanceFn, {
+--       targetNames = { "Scorpion" },                 -- só ataca NPCs com esse texto no nome
+--       farmPoint   = Vector3.new(100, 5, -300),      -- área de farm (anda até lá se não houver NPC)
+--       areaRadius  = 120,                            -- só NPCs a até 120 studs do farmPoint
+--   })
 --   Autofarm.disable()
 --   Autofarm.getKills()
 --
 -- Teclas (enquanto ligado):
---   RightControl = pausa / retoma TUDO (movimento + cliques). Use ao abrir menus.
---   F7           = imprime no Output os dados do NPC mais próximo (para diagnosticar a morte)
+--   RightControl = pausa / retoma TUDO (andar + cliques). Use ao abrir menus.
+--   F7           = imprime no Output os dados do NPC mais próximo (diagnóstico)
 --
--- Diagnóstico: Autofarm.enable(player, distanceFn, { debug = true })
+-- Diagnóstico: { debug = true } imprime linhas [Autofarm] no Output / Console (F9).
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local VirtualUser = game:GetService("VirtualUser")
 local UserInputService = game:GetService("UserInputService")
 local GuiService = game:GetService("GuiService")
+local PathfindingService = game:GetService("PathfindingService")
 
 local Autofarm = {}
 
-local MOVE_STEP = "AutofarmFollow"
 local AIM_STEP  = "AutofarmAim"
 local MY_RADIUS = 1.5 -- raio aproximado do seu personagem (studs)
 
 local DEFAULTS = {
-	behindNpc         = true,    -- fica nas costas do NPC
-	lockAim           = true,    -- personagem sempre virado para o NPC (vence a Trava Shift)
+	-- Alvos e área
+	targetNames       = nil,     -- { "Scorpion" } só NPCs cujo nome contenha algum desses textos
+	npcFilter         = nil,     -- função(npc) -> true/false (filtro extra)
+	farmPoint         = nil,     -- Vector3 | BasePart | função -> Vector3 : área de farm
+	areaRadius        = 120,     -- (com farmPoint) só considera NPCs a até X studs dele
+	searchRadius      = 500,     -- só considera NPCs a até X studs de você
+
+	-- Movimento (anda de verdade)
+	engageDistance    = 14,      -- studs do corpo do NPC em que passa de "viajar" para "combate"
+	pathRecompute     = 1.5,     -- segundos entre recálculos do caminho
+	waypointReach     = 3.5,     -- distância para considerar um waypoint alcançado
+	behindNpc         = true,    -- tenta ficar nas costas do NPC
+	lockAim           = true,    -- personagem sempre virado para o NPC em combate (vence a Trava Shift)
+
+	-- Defesa
+	dodgeOnAttack     = true,    -- desvia quando o NPC começa uma animação de ataque
+	dodgeBack         = 7,       -- quantos studs recua ao desviar
+	dodgeMaxTime      = 1.2,     -- tempo máximo de cada desvio (s)
+	isAttackAnimFn    = nil,     -- função(track) -> true se a animação do NPC é um ataque
+	attackWhileDodging = false,  -- ataca enquanto desvia?
+	minHealthPct      = 0.3,     -- recua quando a vida ficar abaixo disso (0 desliga)
+	resumeHealthPct   = 0.7,     -- volta ao combate acima disso
+	retreatDistance   = 35,      -- até onde recua (studs)
+	retreatMaxTime    = 15,      -- tempo máximo recuado (s)
+	onLowHealth       = nil,     -- função(pctVida): chamada ao recuar (ex.: usar cura)
+
+	-- Ataque
 	attackInterval    = 0.15,    -- segundos entre ataques
 	attackMode        = "auto",  -- "auto" | "native" | "click" | "hold" | "tool"
 	clickFn           = nil,     -- função própria de ataque (substitui attackMode)
-	isDeadFn          = nil,     -- função(npc) -> true se o NPC está morto
-	onKill            = nil,     -- função(npc, totalMortes) chamada quando o alvo morre
+	requireRange      = true,    -- só ataca dentro do alcance estimado
+	reachPadding      = 1.5,     -- tolerância extra do alcance (studs)
 	safeClick         = true,    -- NÃO clica com menu aberto / mouse sobre botão / janela sem foco
+
+	-- Morte / alvo
+	isDeadFn          = nil,     -- função(npc) -> true se o NPC está morto
+	onKill            = nil,     -- função(npc, totalMortes)
 	useBarDetection   = true,    -- detecta morte pela barra de vida do NPC chegando a zero
+	stuckTimeout      = 8,       -- s em combate sem o NPC perder vida => ignora e troca de alvo (0 = desliga)
+	retargetEvery     = 0.5,     -- segundos entre buscas de alvo
+
+	-- Geral
 	pauseKey          = Enum.KeyCode.RightControl,
 	dumpKey           = Enum.KeyCode.F7,
-	captureController = false,   -- chama VirtualUser:CaptureController() ao ligar
-	debug             = false,   -- imprime diagnóstico no Output
-	smoothing         = 20,      -- maior = segue mais rápido; menor = mais suave
-	retargetEvery     = 0.5,     -- segundos entre buscas de alvo
-	reachPadding      = 1.5,     -- tolerância extra do alcance (studs)
-	requireRange      = false,   -- true = só ataca dentro do alcance estimado
-	stuckTimeout      = 8,       -- segundos sem o NPC perder vida => ignora e troca de alvo (0 = desliga)
-	heightOffset      = 0,       -- ajuste de altura em relação ao NPC
+	captureController = false,
+	debug             = false,
 }
 
 local state = nil
@@ -57,6 +95,17 @@ local function log(s, ...)
 end
 
 ----------------------------------------------------------------
+-- Utilidades
+----------------------------------------------------------------
+local function getRoot(model)
+	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+end
+
+local function flatDist(a, b)
+	return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+end
+
+----------------------------------------------------------------
 -- Detecção de morte (vários sinais, porque cada jogo faz de um jeito)
 ----------------------------------------------------------------
 local DEAD_FLAGS = { dead = true, isdead = true, died = true, dying = true, isdying = true }
@@ -64,11 +113,6 @@ local HP_NAMES = {
 	health = true, hp = true, currenthealth = true, currenthp = true, curhealth = true, curhp = true,
 }
 
-local function getRoot(model)
-	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
-end
-
--- Atributos / valores do modelo dizendo que morreu
 local function dataSaysDead(npc)
 	local hum = npc:FindFirstChildOfClass("Humanoid")
 	local holders = { npc }
@@ -106,7 +150,6 @@ local function collectBars(npc)
 	return bars
 end
 
--- Retorna o motivo da morte (string) ou nil se está vivo
 local function deathReason(s, npc)
 	if not npc:IsDescendantOf(workspace) then return nil end
 
@@ -133,7 +176,6 @@ local function deathReason(s, npc)
 	return nil
 end
 
--- Versão leve usada na busca de alvos
 local function isAlive(npc)
 	if not npc or not npc.Parent or not npc:IsDescendantOf(workspace) then return false end
 	if state and state.dead[npc] and os.clock() < state.dead[npc] then return false end
@@ -150,9 +192,6 @@ local function isAlive(npc)
 	return true
 end
 
-----------------------------------------------------------------
--- Utilidades
-----------------------------------------------------------------
 local function isNPC(model, myChar)
 	if not model:IsA("Model") or model == myChar then return false end
 	if Players:GetPlayerFromCharacter(model) then return false end
@@ -170,13 +209,50 @@ local function getReach(s)
 	return s.radius + MY_RADIUS + s.distanceFn() + s.opts.reachPadding
 end
 
-local function pickTarget(hrp, myChar)
+----------------------------------------------------------------
+-- Área de farm e escolha de alvo
+----------------------------------------------------------------
+local function getFarmPoint(s)
+	local fp = s.opts.farmPoint
+	if typeof(fp) == "function" then
+		local ok, v = pcall(fp)
+		fp = ok and v or nil
+	end
+	if typeof(fp) == "Vector3" then return fp end
+	if typeof(fp) == "CFrame" then return fp.Position end
+	if typeof(fp) == "Instance" and fp:IsA("BasePart") then return fp.Position end
+	return nil
+end
+
+local function passesFilters(s, npc)
+	local names = s.opts.targetNames
+	if names and #names > 0 then
+		local lname = string.lower(npc.Name)
+		local match = false
+		for _, n in ipairs(names) do
+			if string.find(lname, string.lower(n), 1, true) then match = true break end
+		end
+		if not match then return false end
+	end
+	if s.opts.npcFilter then
+		local ok, res = pcall(s.opts.npcFilter, npc)
+		if not ok or not res then return false end
+	end
+	return true
+end
+
+local function pickTarget(s, hrp, myChar)
+	local area = getFarmPoint(s)
 	local nearest, nearestDist = nil, math.huge
+
 	for _, obj in ipairs(workspace:GetDescendants()) do
-		if isNPC(obj, myChar) then
-			local d = (hrp.Position - getRoot(obj).Position).Magnitude
-			if d < nearestDist then
-				nearest, nearestDist = obj, d
+		if isNPC(obj, myChar) and passesFilters(s, obj) then
+			local root = getRoot(obj)
+			local d = (hrp.Position - root.Position).Magnitude
+			if d <= s.opts.searchRadius and d < nearestDist then
+				if not area or (root.Position - area).Magnitude <= s.opts.areaRadius then
+					nearest, nearestDist = obj, d
+				end
 			end
 		end
 	end
@@ -209,7 +285,6 @@ local function cursorOverUi(s)
 			if obj:IsA("GuiButton") then
 				return true
 			end
-			-- painéis de menu costumam ser Frames "Active" com fundo visível
 			if obj.Active and obj.BackgroundTransparency < 0.95 then
 				return true
 			end
@@ -218,7 +293,6 @@ local function cursorOverUi(s)
 	return false
 end
 
--- true = pode clicar. Retorna também o motivo quando não pode.
 local function safeToClick(s)
 	if not s.focused then return false, "janela sem foco" end
 	if GuiService.MenuIsOpen then return false, "menu do Roblox aberto" end
@@ -235,13 +309,14 @@ local function clearTargetConns(s)
 	s.targetConns = {}
 end
 
--- Solta o alvo atual. killed = true quando ele morreu (conta como kill)
 local function dropTarget(s, npc, killed, reason)
-	if s.target ~= npc then return end -- evita contar duas vezes
+	if s.target ~= npc then return end
 	clearTargetConns(s)
 	s.target = nil
 	s.bars = {}
-	s.lastScan = 0 -- procura o próximo alvo imediatamente
+	s.path = nil
+	s.waypoints = nil
+	s.lastScan = 0
 
 	log(s, "alvo solto:", npc.Name, "| motivo:", reason or "?", "| kill:", killed)
 
@@ -277,6 +352,10 @@ local function setTarget(s, npc)
 
 	s.radius = getRadius(npc)
 	s.bars = collectBars(npc)
+	s.prevPlaying = {}
+	s.dodgeUntil = 0
+	s.path = nil
+	s.waypoints = nil
 	local h0 = npc:FindFirstChildOfClass("Humanoid")
 	s.lastHealth = h0 and h0.Health or 0
 	s.lastProgress = os.clock()
@@ -289,7 +368,6 @@ local function setTarget(s, npc)
 			dropTarget(s, npc, true, "Humanoid.Died")
 		end))
 	end
-	-- NPC removido do jogo sem morrer (despawn): só troca de alvo, sem contar kill
 	table.insert(s.targetConns, npc.AncestryChanged:Connect(function(_, parent)
 		if not parent then dropTarget(s, npc, false, "removido do jogo") end
 	end))
@@ -314,6 +392,12 @@ local function dumpModel(npc, label)
 	local root = getRoot(npc)
 	if root then
 		print("   Raiz:", root.Name, "Anchored=", root.Anchored, "Transparency=", root.Transparency, "CanCollide=", root.CanCollide)
+	end
+	local animator = npc:FindFirstChildWhichIsA("Animator", true)
+	if animator then
+		for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+			print("   anim tocando:", t.Name, "prioridade=", t.Priority.Name, "loop=", t.Looped, "duração=", t.Length)
+		end
 	end
 	local n = 0
 	for _, d in ipairs(npc:GetDescendants()) do
@@ -345,162 +429,319 @@ local function dumpNearest(s)
 end
 
 ----------------------------------------------------------------
--- Diagnóstico (só roda com debug = true)
+-- Diagnóstico (debug = true)
 ----------------------------------------------------------------
-local function watchTool(s, tool)
-	if not tool or s.watchedTool == tool then return end
-	if s.toolConn then s.toolConn:Disconnect() end
-	s.watchedTool = tool
-	s.toolConn = tool.Activated:Connect(function()
-		s.toolActivated += 1
-	end)
-	log(s, "ferramenta equipada:", tool.Name)
-end
-
-local function debugTick(s, char, hrp)
+local function debugTick(s, hrp, mode)
 	if not s.opts.debug then return end
 	local now = os.clock()
 	if now - s.lastDebug < 1 then return end
 	s.lastDebug = now
 
-	local tool = char:FindFirstChildOfClass("Tool")
-	watchTool(s, tool)
-
 	local npc = s.target
 	if not npc then
-		log(s, "sem alvo | kills:", s.kills)
+		log(s, "modo=" .. mode, "| sem alvo | kills:", s.kills)
 		return
 	end
 
 	local nHrp = getRoot(npc)
-	local toNpc = nHrp and Vector3.new(nHrp.Position.X - hrp.Position.X, 0, nHrp.Position.Z - hrp.Position.Z) or Vector3.zero
-	local look = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
-	local aimErr = 0
-	if toNpc.Magnitude > 0.01 and look.Magnitude > 0.01 then
-		aimErr = math.deg(math.acos(math.clamp(toNpc.Unit:Dot(look.Unit), -1, 1)))
-	end
+	local dist = nHrp and flatDist(hrp.Position, nHrp.Position) or -1
 	local hum = npc:FindFirstChildOfClass("Humanoid")
-
 	log(s, string.format(
-		"alvo=%s vida=%s dist=%.1f alcance=%.1f mira_erro=%.0f° | por segundo: ataques=%d bloqueados=%d fora_alcance=%d | kills=%d%s",
-		npc.Name,
+		"modo=%s alvo=%s vida=%s dist=%.1f alcance=%.1f | por segundo: ataques=%d bloqueados=%d | kills=%d%s",
+		mode, npc.Name,
 		hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "sem humanoid",
-		toNpc.Magnitude, getReach(s), aimErr,
-		s.swings, s.blocked, s.outOfRange, s.kills,
+		dist, getReach(s), s.swings, s.blocked, s.kills,
 		s.paused and " | PAUSADO" or ""
 	))
-	s.swings, s.outOfRange, s.toolActivated, s.uisClicks, s.blocked = 0, 0, 0, 0, 0
+	s.swings, s.blocked = 0, 0
 end
 
 ----------------------------------------------------------------
--- Movimento (antes da câmera, para não tremer)
+-- Navegação (anda de verdade, com pathfinding)
 ----------------------------------------------------------------
-local function follow(dt)
-	local s = state
-	if not s then return end
+local function followPath(s, hrp, hum, goal)
+	local now = os.clock()
+	local needNew = (not s.path)
+		or (now - s.pathTime > s.opts.pathRecompute)
+		or (s.pathGoal and (s.pathGoal - goal).Magnitude > 8)
 
+	if needNew then
+		s.path = true
+		s.pathTime = now
+		s.pathGoal = goal
+
+		local path = PathfindingService:CreatePath({
+			AgentRadius = 2,
+			AgentHeight = 5,
+			AgentCanJump = true,
+		})
+		local ok = pcall(function() path:ComputeAsync(hrp.Position, goal) end)
+		if ok and path.Status == Enum.PathStatus.Success then
+			s.waypoints = path:GetWaypoints()
+			s.wpIndex = 2 -- o 1 é onde você já está
+		else
+			s.waypoints = nil
+		end
+	end
+
+	local wps = s.waypoints
+	if not wps then
+		hum:MoveTo(goal) -- sem caminho calculado: tenta em linha reta
+		return
+	end
+
+	local wp = wps[s.wpIndex]
+	while wp and flatDist(hrp.Position, wp.Position) < s.opts.waypointReach do
+		s.wpIndex += 1
+		wp = wps[s.wpIndex]
+	end
+
+	if not wp then
+		hum:MoveTo(goal)
+		return
+	end
+	if wp.Action == Enum.PathWaypointAction.Jump then
+		hum.Jump = true
+	end
+	hum:MoveTo(wp.Position)
+end
+
+-- Se parado por >1,5s enquanto deveria andar: pula e recalcula o caminho
+local function antiStuck(s, hrp, hum)
+	local now = os.clock()
+	if now - s.stuckCheck < 1.5 then return end
+	if (hrp.Position - s.stuckPos).Magnitude < 1 then
+		hum.Jump = true
+		s.path = nil
+	end
+	s.stuckPos = hrp.Position
+	s.stuckCheck = now
+end
+
+local ATTACK_PRIORITIES = {
+	[Enum.AnimationPriority.Action] = true,
+	[Enum.AnimationPriority.Action2] = true,
+	[Enum.AnimationPriority.Action3] = true,
+	[Enum.AnimationPriority.Action4] = true,
+}
+
+-- Detecta o início de uma animação de ataque do NPC e agenda um desvio
+local function pollAttackAnim(s)
+	local npc = s.target
+	if not npc then return end
+	local animator = npc:FindFirstChildWhichIsA("Animator", true)
+	if not animator then return end
+
+	local playing = {}
+	for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+		playing[track] = true
+		if not s.prevPlaying[track] then
+			local isAttack
+			if s.opts.isAttackAnimFn then
+				local ok, r = pcall(s.opts.isAttackAnimFn, track)
+				isAttack = ok and r == true
+			else
+				isAttack = (not track.Looped) and ATTACK_PRIORITIES[track.Priority] == true
+			end
+
+			log(s, "anim do NPC:", track.Name, "| prioridade:", track.Priority.Name,
+				"| loop:", track.Looped, "| duração:", string.format("%.2f", track.Length),
+				"| ataque?", isAttack)
+
+			if isAttack and s.opts.dodgeOnAttack then
+				local len = track.Length > 0 and track.Length or 0.8
+				s.dodgeUntil = os.clock() + math.min(len, s.opts.dodgeMaxTime)
+				s.dodgeSide = -s.dodgeSide
+			end
+		end
+	end
+	s.prevPlaying = playing
+end
+
+local function dodgePosition(s, hrp, npcPos)
+	local away = Vector3.new(hrp.Position.X - npcPos.X, 0, hrp.Position.Z - npcPos.Z)
+	if away.Magnitude < 0.01 then
+		away = -hrp.CFrame.LookVector
+		away = Vector3.new(away.X, 0, away.Z)
+	end
+	away = away.Unit
+	local rotated = CFrame.Angles(0, math.rad(35) * s.dodgeSide, 0):VectorToWorldSpace(away)
+	local dist = s.radius + MY_RADIUS + s.distanceFn() + s.opts.dodgeBack
+	return Vector3.new(npcPos.X, hrp.Position.Y, npcPos.Z) + rotated * dist
+end
+
+local function updateTargetState(s, now)
+	if s.target and not s.target:IsDescendantOf(workspace) then
+		dropTarget(s, s.target, false, "removido do jogo")
+	end
+
+	if s.target then
+		local reason = deathReason(s, s.target)
+		if reason then
+			local npc = s.target
+			s.dead[npc] = now + 60
+			dropTarget(s, npc, true, reason)
+		end
+	end
+
+	-- Em combate e o NPC não perde vida há muito tempo: ignora por 15s e troca
+	if s.target and s.opts.stuckTimeout > 0 then
+		local th = s.target:FindFirstChildOfClass("Humanoid")
+		if th then
+			if th.Health < s.lastHealth - 0.01 or not s.engaged then s.lastProgress = now end
+			s.lastHealth = th.Health
+			if now - s.lastProgress > s.opts.stuckTimeout then
+				s.ignored[s.target] = now + 15
+				dropTarget(s, s.target, false, "sem perder vida há " .. s.opts.stuckTimeout .. "s (ignorado por 15s)")
+			end
+		end
+	end
+end
+
+local function navStep(s)
 	local char = s.player.Character
 	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
 	local hum  = char and char:FindFirstChildOfClass("Humanoid")
-	if not hrp or not hum or hum.Health <= 0 then return end
+	if not hrp or not hum or hum.Health <= 0 then
+		s.engaged = false
+		return
+	end
 
 	-- Pausado: devolve o controle ao jogador
 	if s.paused then
 		if s.prevAutoRotate ~= nil then
 			hum.AutoRotate = s.prevAutoRotate
 			s.prevAutoRotate = nil
+			hum:MoveTo(hrp.Position)
 		end
+		s.engaged = false
+		return
+	end
+	if s.prevAutoRotate == nil then s.prevAutoRotate = hum.AutoRotate end
+
+	local now = os.clock()
+
+	-- Vida baixa: recua e espera recuperar
+	if s.opts.minHealthPct > 0 and hum.MaxHealth > 0 then
+		local pct = hum.Health / hum.MaxHealth
+		if s.retreating then
+			if pct >= s.opts.resumeHealthPct or now - s.retreatStart > s.opts.retreatMaxTime then
+				s.retreating = false
+				log(s, "voltando ao combate | vida:", string.format("%.0f%%", pct * 100))
+			end
+		elseif pct <= s.opts.minHealthPct then
+			s.retreating = true
+			s.retreatStart = now
+			log(s, "vida baixa, recuando |", string.format("%.0f%%", pct * 100))
+			if s.opts.onLowHealth then task.spawn(s.opts.onLowHealth, pct) end
+		end
+	end
+
+	updateTargetState(s, now)
+
+	-- Sem alvo: procura
+	if not s.target and now - s.lastScan >= s.opts.retargetEvery then
+		s.lastScan = now
+		local found = pickTarget(s, hrp, char)
+		if found then setTarget(s, found) end
+	end
+
+	-- Recuo
+	if s.retreating then
+		s.engaged = false
+		hum.AutoRotate = true
+		local root = s.target and getRoot(s.target)
+		if root then
+			local away = Vector3.new(hrp.Position.X - root.Position.X, 0, hrp.Position.Z - root.Position.Z)
+			if away.Magnitude < 0.01 then away = Vector3.new(0, 0, 1) end
+			if away.Magnitude < s.opts.retreatDistance then
+				hum:MoveTo(hrp.Position + away.Unit * 10)
+			end
+		end
+		debugTick(s, hrp, "recuo")
 		return
 	end
 
-	-- Impede o personagem de girar sozinho
-	if s.prevAutoRotate == nil then s.prevAutoRotate = hum.AutoRotate end
-	hum.AutoRotate = false
-
-	-- Alvo removido do jogo
-	if s.target and not s.target:IsDescendantOf(workspace) then
-		dropTarget(s, s.target, false, "removido do jogo")
-	end
-
-	-- Alvo morreu? (vários sinais)
-	if s.target then
-		local reason = deathReason(s, s.target)
-		if reason then
-			local npc = s.target
-			s.dead[npc] = os.clock() + 60 -- não volta a escolher o cadáver
-			dropTarget(s, npc, true, reason)
-		end
-	end
-
-	-- Alvo que não perde vida há muito tempo (travado/invulnerável): ignora por 15s e troca
-	if s.target and s.opts.stuckTimeout > 0 then
-		local th = s.target:FindFirstChildOfClass("Humanoid")
-		if th then
-			local t = os.clock()
-			if th.Health < s.lastHealth - 0.01 then s.lastProgress = t end
-			s.lastHealth = th.Health
-			if t - s.lastProgress > s.opts.stuckTimeout then
-				s.ignored[s.target] = t + 15
-				dropTarget(s, s.target, false, "sem perder vida há " .. s.opts.stuckTimeout .. "s (ignorado por 15s)")
-			end
-		end
-	end
-
-	-- Sem alvo: procura o mais próximo
+	-- Sem alvo: anda até a área de farm (ou última área onde havia NPC)
 	if not s.target then
-		local now = os.clock()
-		if now - s.lastScan >= s.opts.retargetEvery then
-			s.lastScan = now
-			local found = pickTarget(hrp, char)
-			if found then setTarget(s, found) end
+		s.engaged = false
+		hum.AutoRotate = true
+		local area = getFarmPoint(s) or s.lastAreaPoint
+		if area and flatDist(hrp.Position, area) > 10 then
+			followPath(s, hrp, hum, area)
+			antiStuck(s, hrp, hum)
 		end
+		debugTick(s, hrp, "indo para a área")
+		return
 	end
-
-	debugTick(s, char, hrp)
 
 	local npc = s.target
-	if not npc then return end
 	local nHrp = getRoot(npc)
 	if not nHrp then return end
-
-	-- Distância centro-a-centro = raio do NPC + seu raio + folga configurada
-	local offset = s.radius + MY_RADIUS + s.distanceFn()
 	local npcPos = nHrp.Position
+	s.lastAreaPoint = npcPos
 
-	local dir
-	if s.opts.behindNpc then
-		dir = -nHrp.CFrame.LookVector
-	else
-		dir = hrp.Position - npcPos
+	pollAttackAnim(s)
+
+	local offset = s.radius + MY_RADIUS + s.distanceFn()
+	local flat = flatDist(hrp.Position, npcPos)
+
+	-- Longe: viaja andando até perto do NPC
+	if flat > offset + s.opts.engageDistance then
+		s.engaged = false
+		hum.AutoRotate = true
+		followPath(s, hrp, hum, npcPos)
+		antiStuck(s, hrp, hum)
+		debugTick(s, hrp, "viajando")
+		return
 	end
-	dir = Vector3.new(dir.X, 0, dir.Z)
-	if dir.Magnitude < 0.01 then
-		dir = -hrp.CFrame.LookVector
+
+	-- Perto: combate
+	s.engaged = true
+	hum.AutoRotate = false
+	s.path = nil
+
+	local goal
+	if s.opts.dodgeOnAttack and now < s.dodgeUntil then
+		goal = dodgePosition(s, hrp, npcPos)
+	else
+		local dir
+		if s.opts.behindNpc then
+			dir = -nHrp.CFrame.LookVector
+		else
+			dir = hrp.Position - npcPos
+		end
 		dir = Vector3.new(dir.X, 0, dir.Z)
+		if dir.Magnitude < 0.01 then
+			dir = -hrp.CFrame.LookVector
+			dir = Vector3.new(dir.X, 0, dir.Z)
+		end
+		goal = Vector3.new(npcPos.X, hrp.Position.Y, npcPos.Z) + dir.Unit * offset
 	end
+	hum:MoveTo(goal)
 
-	local goalPos = npcPos + dir.Unit * offset
-	goalPos = Vector3.new(goalPos.X, npcPos.Y + s.opts.heightOffset, goalPos.Z)
+	debugTick(s, hrp, (s.opts.dodgeOnAttack and now < s.dodgeUntil) and "desviando" or "combate")
+end
 
-	-- Posição suave (independe do FPS)
-	local alpha = 1 - math.exp(-s.opts.smoothing * dt)
-	local newPos = hrp.Position:Lerp(goalPos, alpha)
-
-	local lookAt = Vector3.new(npcPos.X, newPos.Y, npcPos.Z)
-	if (lookAt - newPos).Magnitude > 0.05 then
-		hrp.CFrame = CFrame.lookAt(newPos, lookAt)
-	else
-		hrp.CFrame = CFrame.new(newPos) * hrp.CFrame.Rotation
+local function navLoop(s)
+	while state == s do
+		local ok, err = pcall(navStep, s)
+		if not ok then
+			local t = os.clock()
+			if t - s.lastErr > 5 then
+				s.lastErr = t
+				warn("[Autofarm] erro na navegação:", err)
+			end
+		end
+		task.wait(0.1)
 	end
-	hrp.AssemblyLinearVelocity = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
 end
 
 -- Roda DEPOIS da câmera: a Trava Shift vira o personagem para onde a câmera olha,
 -- então reaplicamos a mira no NPC logo depois. A câmera não é alterada.
 local function aim()
 	local s = state
-	if not s or s.paused or not s.opts.lockAim or not s.target then return end
+	if not s or s.paused or not s.opts.lockAim or not s.engaged or s.retreating or not s.target then return end
 	local char = s.player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if hrp then aimAtTarget(s, hrp) end
@@ -526,7 +767,6 @@ local function swing(s, char)
 	local useHold   = (mode == "hold")
 	local useTool   = (mode == "tool") or (mode == "auto")
 
-	-- Cliques de mouse acontecem onde o cursor está: só clica se for seguro
 	if useNative or useClick or useHold then
 		local ok, why = true, nil
 		if s.opts.safeClick then ok, why = safeToClick(s) end
@@ -568,25 +808,23 @@ end
 
 local function attack()
 	local s = state
-	if not s or s.paused or not isAlive(s.target) then return end
+	if not s or s.paused or s.retreating or not s.engaged or not isAlive(s.target) then return end
 
 	local now = os.clock()
 	if now - s.lastAttack < s.opts.attackInterval then return end
+
+	-- Não ataca enquanto desvia
+	if s.opts.dodgeOnAttack and not s.opts.attackWhileDodging and now < s.dodgeUntil then return end
 
 	local char = s.player.Character
 	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
 	local hum  = char and char:FindFirstChildOfClass("Humanoid")
 	if not hrp or not hum or hum.Health <= 0 then return end
 
-	-- Alcance estimado
 	local nPos = getRoot(s.target).Position
-	local flat = Vector3.new(hrp.Position.X - nPos.X, 0, hrp.Position.Z - nPos.Z).Magnitude
-	if flat > getReach(s) then
-		s.outOfRange += 1
-		if s.opts.requireRange then return end
-	end
+	if s.opts.requireRange and flatDist(hrp.Position, nPos) > getReach(s) then return end
 
-	-- Sem ferramenta na mão: tenta equipar (no máximo 1x por segundo, sem travar o ataque)
+	-- Sem ferramenta na mão: tenta equipar (no máximo 1x por segundo)
 	if not char:FindFirstChildOfClass("Tool") and now - s.lastEquip > 1 then
 		local backpack = s.player:FindFirstChildOfClass("Backpack")
 		local first = backpack and backpack:FindFirstChildOfClass("Tool")
@@ -597,7 +835,6 @@ local function attack()
 		end
 	end
 
-	-- Garante a mira no NPC no instante do golpe
 	if s.opts.lockAim then aimAtTarget(s, hrp) end
 
 	s.lastAttack = now
@@ -626,21 +863,30 @@ function Autofarm.enable(player, distanceFn, options)
 		bars          = {},
 		dead          = {},
 		ignored       = {},
+		prevPlaying   = {},
 		radius        = 0,
 		kills         = 0,
 		lastAttack    = 0,
 		lastScan      = 0,
 		lastEquip     = 0,
 		lastDebug     = 0,
+		lastErr       = 0,
 		lastHealth    = 0,
 		lastProgress  = 0,
 		swings        = 0,
 		blocked       = 0,
-		outOfRange    = 0,
-		toolActivated = 0,
-		uisClicks     = 0,
+		dodgeUntil    = 0,
+		dodgeSide     = 1,
+		retreating    = false,
+		retreatStart  = 0,
+		engaged       = false,
 		paused        = false,
 		focused       = true,
+		path          = nil,
+		pathTime      = 0,
+		stuckCheck    = 0,
+		stuckPos      = Vector3.zero,
+		lastAreaPoint = nil,
 	}
 	state = s
 
@@ -652,15 +898,10 @@ function Autofarm.enable(player, distanceFn, options)
 		pcall(function() VirtualUser:CaptureController() end)
 	end
 
-	-- Foco da janela: nunca clica se o Roblox não estiver em foco
 	table.insert(s.conns, UserInputService.WindowFocused:Connect(function() s.focused = true end))
 	table.insert(s.conns, UserInputService.WindowFocusReleased:Connect(function() s.focused = false end))
 
-	-- Teclas de pausa e dump
 	table.insert(s.conns, UserInputService.InputBegan:Connect(function(input, gameProcessed)
-		if opts.debug and input.UserInputType == Enum.UserInputType.MouseButton1 then
-			s.uisClicks += 1
-		end
 		if gameProcessed then return end
 		if input.KeyCode == opts.pauseKey then
 			s.paused = not s.paused
@@ -672,28 +913,28 @@ function Autofarm.enable(player, distanceFn, options)
 
 	log(s, "ligado | attackMode =", opts.attackMode, "| mouse1click disponível =", type(mouse1click) == "function")
 
-	RunService:BindToRenderStep(MOVE_STEP, Enum.RenderPriority.Camera.Value - 1, follow)
 	RunService:BindToRenderStep(AIM_STEP, Enum.RenderPriority.Camera.Value + 1, aim)
 	s.attackConn = RunService.Heartbeat:Connect(attack)
+	task.spawn(navLoop, s)
 end
 
 function Autofarm.disable()
 	if not state then return end
+	local s = state
+	state = nil -- faz o loop de navegação terminar
 
-	pcall(function() RunService:UnbindFromRenderStep(MOVE_STEP) end)
 	pcall(function() RunService:UnbindFromRenderStep(AIM_STEP) end)
-	if state.attackConn then state.attackConn:Disconnect() end
-	if state.toolConn then state.toolConn:Disconnect() end
-	for _, c in ipairs(state.conns) do c:Disconnect() end
-	clearTargetConns(state)
+	if s.attackConn then s.attackConn:Disconnect() end
+	for _, c in ipairs(s.conns) do c:Disconnect() end
+	clearTargetConns(s)
 
-	local char = state.player.Character
+	local char = s.player.Character
 	local hum  = char and char:FindFirstChildOfClass("Humanoid")
-	if hum and state.prevAutoRotate ~= nil then
-		hum.AutoRotate = state.prevAutoRotate
+	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+	if hum then
+		if s.prevAutoRotate ~= nil then hum.AutoRotate = s.prevAutoRotate end
+		if hrp then hum:MoveTo(hrp.Position) end
 	end
-
-	state = nil
 end
 
 function Autofarm.getKills()
