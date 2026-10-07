@@ -24,7 +24,15 @@
 --   priority = "nearest" | "lowestHp" | "highestHp"   (padrão: nearest)
 --   farmPoint = Vector3.new(x,y,z), areaRadius = 150   só farma NPCs perto desse ponto
 --   npcFilter = function(npc) return true end          filtro extra (ex.: por nível)
---   hud = true                                         painel na tela com status e kills
+--   hud = true                                         (opcional) painel na tela; padrão: desligado
+--
+-- Modo "mata tudo por perto" (tudo no mesmo arquivo, sem servidor extra):
+--   aura = true, auraRadius = 30, auraMax = 10   a cada golpe, ataca também TODOS os NPCs no raio
+--   stationary = true                            fica PARADO e só ataca todos os NPCs no raio
+--   (o servidor continua decidindo o que aceita; o raio padrão é curto de propósito)
+--
+-- NPCs de quest/loja são ignorados sozinhos (nome com quest/shop/vendor/giver..., ou com
+-- ProximityPrompt/ClickDetector/Dialog). Para ignorar outros: ignoreNames = { "texto" }
 --
 -- Opções úteis:
 --   orbit = true         gira em volta (false = fica atrás)
@@ -129,15 +137,51 @@ local function readHp(o, npc)
 	return h and h.Health or 0
 end
 
+-- NPCs que NÃO são inimigos (quest, loja, etc.): nunca viram alvo
+local FRIENDLY_WORDS = { "quest", "shop", "vendor", "merchant", "giver", "trainer", "banker", "seller", "dealer", "shopkeeper" }
+local friendlyCache = setmetatable({}, { __mode = "k" })
+
+local function isFriendly(o, npc)
+	local c = friendlyCache[npc]
+	if c ~= nil then return c end
+	local result = false
+	local lname = npc.Name:lower()
+	for _, w in ipairs(FRIENDLY_WORDS) do
+		if lname:find(w, 1, true) then result = true break end
+	end
+	if not result and o.ignoreNames then
+		for _, w in ipairs(o.ignoreNames) do
+			if lname:find(w:lower(), 1, true) then result = true break end
+		end
+	end
+	-- NPC com prompt de interação / diálogo = quest, loja, etc.
+	if not result and o.skipInteractive then
+		if npc:FindFirstChildWhichIsA("ProximityPrompt", true)
+			or npc:FindFirstChildWhichIsA("ClickDetector", true)
+			or npc:FindFirstChildWhichIsA("Dialog", true) then
+			result = true
+		end
+	end
+	friendlyCache[npc] = result
+	return result
+end
+
+local function valid(o, ignored, char, npc, now)
+	return npc.Parent ~= nil and npc ~= char
+		and not Players:GetPlayerFromCharacter(npc)
+		and alive(npc) and nameOk(npc, o.targetNames)
+		and not isFriendly(o, npc)
+		and (not ignored[npc] or now > ignored[npc])
+		and not ignored["name:" .. npc.Name]
+end
+
 local function findTarget(char, hrp, o, ignored)
 	local best, bestScore = nil, math.huge
 	local now = os.clock()
 	for npc in pairs(npcSet) do
 		if not npc.Parent then
 			npcSet[npc] = nil
-		elseif npc ~= char and not Players:GetPlayerFromCharacter(npc)
-			and alive(npc) and nameOk(npc, o.targetNames)
-			and (not ignored[npc] or now > ignored[npc]) then
+		elseif valid(o, ignored, char, npc, now) then
 			local pos = getRoot(npc).Position
 			local d = (pos - hrp.Position).Magnitude
 			local inArea = (not o.farmPoint) or (pos - o.farmPoint).Magnitude <= o.areaRadius
@@ -195,6 +239,22 @@ end
 ----------------------------------------------------------------
 -- Principal
 ----------------------------------------------------------------
+-- Ataca TODOS os NPCs válidos dentro do raio (aura). Retorna quantos atacou.
+local function auraHit(o, char, hrp, ignored, now, except)
+	local n = 0
+	for npc in pairs(npcSet) do
+		if n >= o.auraMax then break end
+		if npc ~= except and valid(o, ignored, char, npc, now) then
+			local r = getRoot(npc)
+			if (r.Position - hrp.Position).Magnitude <= o.auraRadius then
+				n += 1
+				attack(o, char, npc)
+			end
+		end
+	end
+	return n
+end
+
 function Autofarm.enable(player, distanceFn, options)
 	Autofarm.disable()
 
@@ -203,7 +263,14 @@ function Autofarm.enable(player, distanceFn, options)
 		priority        = "nearest",
 		farmPoint       = nil,
 		areaRadius      = 150,
-		hud             = true,
+		hud             = false,
+		aura            = false,  -- ataca TODOS os NPCs por perto (no raio auraRadius) a cada golpe
+		auraRadius      = 30,
+		auraMax         = 10,     -- máx. de NPCs atacados por disparo
+		stationary      = false,  -- true = NÃO anda/gruda: fica parado matando todos os NPCs por perto
+		skipInteractive = true,   -- ignora NPCs com ProximityPrompt/ClickDetector/Dialog (quest, loja)
+		ignoreNames     = nil,    -- { "texto" } nomes extras para NUNCA atacar
+		maxTimeNoDamage = 10,     -- s sem tirar vida de um NPC => ignora ele
 		gap             = nil,
 		heightOffset    = 0,
 		orbit           = true,
@@ -215,7 +282,7 @@ function Autofarm.enable(player, distanceFn, options)
 		burst           = 1,
 		autoCalibrate   = true,
 		calibrateAfter  = 1.2,
-		skipAfterFail   = 20,
+		skipAfterFail   = 60,
 		minHealthPct    = 0,     -- 0 = nunca recua. Ex.: 0.3 = foge quando a vida cair abaixo de 30%
 		resumeHealthPct = 0.7,
 		safeHeight      = 40,
@@ -262,11 +329,28 @@ function Autofarm.enable(player, distanceFn, options)
 	local learned, ignored = {}, {}
 	local profIdx, profStart, lastHp, lastDamage = 1, 0, 0, 0
 	local failCycles, everSawDamage, calibrating = 0, false, o.autoCalibrate
+	local failTargets, gotDamage, targetStart = 0, false, 0
 	local retreating, retreatStart, safePos = false, 0, nil
 	local inPos = false
 	local paused = false
 	local target, angle = nil, 0
 	local lastAttack, lastScan, lastDbg, lastEquip, swings = 0, 0, 0, 0, 0
+
+	local function giveUp(npc, now)
+		ignored[npc] = now + o.skipAfterFail
+		if everSawDamage then
+			ignored["name:" .. npc.Name] = math.huge
+			print("[Autofarm] '" .. npc.Name .. "' não sofre dano: ignorado (provavelmente não é inimigo)")
+		else
+			failTargets += 1
+			print("[Autofarm] '" .. npc.Name .. "' não sofreu dano: ignorado por enquanto")
+			if failTargets >= 3 and calibrating then
+				calibrating = false
+				warn("[Autofarm] Nenhum dano detectado em 3 NPCs. Provável: attackRemote/attackArgs errado, ou a vida do NPC não é Humanoid.Health (use hpFn).")
+			end
+		end
+		target = nil
+	end
 
 	table.insert(conns, UserInputService.InputBegan:Connect(function(input, gp)
 		if gp then return end
@@ -318,6 +402,15 @@ function Autofarm.enable(player, distanceFn, options)
 			end
 		end
 
+		-- modo parado: não anda, só ataca todos os NPCs por perto
+		if o.stationary then
+			if now - lastAttack >= o.attackInterval then
+				lastAttack = now
+				swings += auraHit(o, char, hrp, ignored, now, nil)
+			end
+			return
+		end
+
 		-- alvo morreu / sumiu
 		if target and not alive(target) then
 			local th = target:FindFirstChildOfClass("Humanoid")
@@ -335,6 +428,7 @@ function Autofarm.enable(player, distanceFn, options)
 					radius = r * (o.hitboxScale or 1)
 					profIdx = learned[target.Name] or 1
 					profStart, lastDamage, inPos = now, now, false
+					targetStart, gotDamage = now, false
 					lastHp = readHp(o, target)
 					print(string.format("[Autofarm] alvo: %s | raio: %.1f | perfil inicial: %d%s",
 						target.Name, radius, profIdx, learned[target.Name] and " (aprendido)" or ""))
@@ -403,6 +497,7 @@ function Autofarm.enable(player, distanceFn, options)
 					swings += 1
 					attack(o, char, target)
 				end
+				if o.aura then swings += auraHit(o, char, hrp, ignored, now, target) end
 			end
 		end
 
@@ -410,6 +505,7 @@ function Autofarm.enable(player, distanceFn, options)
 		local hp = readHp(o, target)
 		if hp < lastHp - 0.01 then
 			lastDamage = now
+			gotDamage = true
 			everSawDamage = true
 			failCycles = 0
 			if learned[target.Name] ~= profIdx then
@@ -430,17 +526,15 @@ function Autofarm.enable(player, distanceFn, options)
 			if profIdx > #profiles then
 				profIdx = 1
 				failCycles += 1
-				if everSawDamage then
-					print("[Autofarm] nenhum perfil acertou em", target.Name, "- ignorando por", o.skipAfterFail, "s")
-					ignored[target] = now + o.skipAfterFail
-					target = nil
-				elseif failCycles >= 2 then
-					calibrating = false
-					warn("[Autofarm] Não detectei dano em NENHUM NPC. Provável: attackRemote errado, ou a vida do NPC não é Humanoid.Health (use hpFn). Calibração desligada.")
-				end
 			elseif o.debug then
 				print(string.format("[Autofarm] sem dano, testando perfil %d/%d", profIdx, #profiles))
 			end
+		end
+
+		-- NPC que não perde vida nenhuma (quest giver etc.): desiste dele
+		if calibrating and not gotDamage and now - targetStart > o.maxTimeNoDamage then
+			giveUp(target, now)
+			return
 		end
 
 		if o.debug and now - lastDbg > 1 and target then
