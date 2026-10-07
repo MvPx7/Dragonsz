@@ -1,4 +1,4 @@
--- autofarm_v5.lua
+-- autofarm_v6.lua
 -- Estilo autofarm "grudado": o personagem fica posicionado em volta do NPC a cada frame
 -- (atrás dele ou girando em órbita), sempre virado pra ele, atacando sem depender do mouse.
 -- Se o NPC estiver longe, desliza até ele rápido (sem teleporte, a não ser que você ligue).
@@ -15,6 +15,12 @@
 --   Autofarm.listRemotes()  -- lista os RemoteEvents do ReplicatedStorage (pra achar o do ataque)
 --
 -- RightControl = pausa / retoma
+-- [  e  ]      = diminui / aumenta a folga da hitbox em tempo real (ajuste até acertar)
+--
+-- Hitbox: a distância é calculada POR NPC = raio do corpo + raio seu + folga (gap).
+--   gap vem do distanceFn() (ou da opção gap) e pode ser ajustado com [ e ].
+--   radiusFn = function(npc) return raioEmStuds end   -- opcional, para forçar o raio de algum NPC
+--   hitboxScale = 1                                    -- multiplica o raio medido (ex.: 1.2 para NPCs grandes)
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
@@ -34,6 +40,23 @@ end
 local function alive(npc)
 	local h = npc.Parent and npc:FindFirstChildOfClass("Humanoid")
 	return h ~= nil and h.Health > 0 and getRoot(npc) ~= nil
+end
+
+local MY_RADIUS = 1.5
+
+-- Raio horizontal do corpo do NPC (ignora acessórios/ferramentas, que inflam a caixa).
+-- Para cada parte do corpo: distância do centro da parte até a raiz + metade do tamanho dela.
+local function bodyRadius(npc)
+	local root = getRoot(npc)
+	if not root then return 3 end
+	local r = math.max(root.Size.X, root.Size.Z) / 2
+	for _, p in ipairs(npc:GetChildren()) do
+		if p:IsA("BasePart") and p ~= root then
+			local off = Vector3.new(p.Position.X - root.Position.X, 0, p.Position.Z - root.Position.Z).Magnitude
+			r = math.max(r, off + math.min(p.Size.X, p.Size.Z) / 2)
+		end
+	end
+	return r
 end
 
 local function nameOk(npc, names)
@@ -84,7 +107,7 @@ function Autofarm.enable(player, distanceFn, options)
 
 	local o = {
 		searchRadius   = 1000,
-		distance       = nil,   -- studs do centro do NPC (padrão: distanceFn() + 2)
+		gap            = nil,   -- folga entre a hitbox do NPC e você (padrão: distanceFn())
 		heightOffset   = 0,     -- sobe/desce em relação ao NPC
 		orbit          = true,  -- true = gira em volta; false = fica atrás do NPC
 		orbitSpeed     = 2.5,   -- radianos por segundo
@@ -95,7 +118,8 @@ function Autofarm.enable(player, distanceFn, options)
 		debug          = false,
 	}
 	for k, v in pairs(options or {}) do o[k] = v end
-	local distance = o.distance or ((distanceFn and distanceFn() or 3) + 2)
+	local gap = o.gap or (distanceFn and distanceFn() or 3)
+	local radius, distance = 0, 0
 
 	if not o.attackRemote and not o.clickFn then
 		warn("[Autofarm] SEM attackRemote/clickFn: o ataque vai depender de mouse1click/tool:Activate e provavelmente não funciona. Use Autofarm.listRemotes() para achar o remote do ataque.")
@@ -108,9 +132,16 @@ function Autofarm.enable(player, distanceFn, options)
 	local lastAttack, lastScan, lastDbg, lastEquip, swings = 0, 0, 0, 0, 0
 
 	table.insert(conns, UserInputService.InputBegan:Connect(function(input, gp)
-		if not gp and input.KeyCode == Enum.KeyCode.RightControl then
+		if gp then return end
+		if input.KeyCode == Enum.KeyCode.RightControl then
 			paused = not paused
 			print("[Autofarm]", paused and "PAUSADO" or "RETOMADO")
+		elseif input.KeyCode == Enum.KeyCode.LeftBracket then
+			gap = math.max(-MY_RADIUS, gap - 0.5)
+			print("[Autofarm] gap =", gap)
+		elseif input.KeyCode == Enum.KeyCode.RightBracket then
+			gap += 0.5
+			print("[Autofarm] gap =", gap)
 		end
 	end))
 
@@ -137,9 +168,16 @@ function Autofarm.enable(player, distanceFn, options)
 			if now - lastScan > 0.3 then
 				lastScan = now
 				target = findTarget(char, hrp, o)
+				if target then
+					local r = o.radiusFn and o.radiusFn(target) or bodyRadius(target)
+					radius = r * (o.hitboxScale or 1)
+					print(string.format("[Autofarm] alvo: %s | raio do corpo: %.1f", target.Name, radius))
+				end
 			end
 			return
 		end
+
+		distance = radius + MY_RADIUS + gap
 
 		local npcRoot = getRoot(target)
 		local npcPos = npcRoot.Position
@@ -191,8 +229,8 @@ function Autofarm.enable(player, distanceFn, options)
 
 		if o.debug and now - lastDbg > 1 then
 			lastDbg = now
-			print(string.format("[Autofarm] alvo=%s distAoPonto=%.1f ataques/s=%d kills=%d remote=%s",
-				target.Name, d, swings, kills, tostring(o.attackRemote ~= nil or o.clickFn ~= nil)))
+			print(string.format("[Autofarm] alvo=%s raio=%.1f distancia=%.1f gap=%.1f ataques/s=%d kills=%d remote=%s",
+				target.Name, radius, distance, gap, swings, kills, tostring(o.attackRemote ~= nil or o.clickFn ~= nil)))
 			swings = 0
 		end
 	end))
