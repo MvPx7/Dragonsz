@@ -1,4 +1,4 @@
--- autofarm_v9.lua
+-- autofarm.lua (versão final, arquivo único)
 -- Autofarm "grudado" com AUTO-CALIBRAÇÃO:
 --   * Fica em volta do NPC (órbita ou atrás), sempre virado pra ele, atacando sem mouse.
 --   * Distância calculada por NPC (raio do corpo + seu raio + folga), então NPC grande funciona.
@@ -19,6 +19,12 @@
 --   })
 --   Autofarm.disable()
 --   Autofarm.listRemotes()
+--
+-- Escolha de alvo:
+--   priority = "nearest" | "lowestHp" | "highestHp"   (padrão: nearest)
+--   farmPoint = Vector3.new(x,y,z), areaRadius = 150   só farma NPCs perto desse ponto
+--   npcFilter = function(npc) return true end          filtro extra (ex.: por nível)
+--   hud = true                                         painel na tela com status e kills
 --
 -- Opções úteis:
 --   orbit = true         gira em volta (false = fica atrás)
@@ -43,6 +49,7 @@ local session = 0
 local kills = 0
 local conns = {}
 local lastHum
+local hudGui
 
 local MY_RADIUS = 1.5
 
@@ -54,8 +61,40 @@ local function getRoot(m)
 end
 
 local function alive(npc)
-	local h = npc.Parent and npc:FindFirstChildOfClass("Humanoid")
+	if not npc.Parent or not npc:IsDescendantOf(workspace) then return false end
+	local h = npc:FindFirstChildOfClass("Humanoid")
 	return h ~= nil and h.Health > 0 and getRoot(npc) ~= nil
+end
+
+----------------------------------------------------------------
+-- Cache de NPCs (monta UMA vez, depois só eventos) -> sem travar o jogo
+----------------------------------------------------------------
+local npcSet = {}
+local cacheConns = {}
+
+local function addHumanoid(h)
+	local m = h.Parent
+	if m and m:IsA("Model") then npcSet[m] = true end
+end
+
+local function buildCache()
+	for _, c in ipairs(cacheConns) do c:Disconnect() end
+	cacheConns = {}
+	npcSet = {}
+	table.insert(cacheConns, workspace.DescendantAdded:Connect(function(d)
+		if d:IsA("Humanoid") then addHumanoid(d) end
+	end))
+	table.insert(cacheConns, workspace.DescendantRemoving:Connect(function(d)
+		if d:IsA("Humanoid") and d.Parent then npcSet[d.Parent] = nil end
+	end))
+	-- varredura inicial em pedaços (cede o frame a cada 3000 itens)
+	task.spawn(function()
+		local list = workspace:GetDescendants()
+		for i, d in ipairs(list) do
+			if d:IsA("Humanoid") then addHumanoid(d) end
+			if i % 3000 == 0 then task.wait() end
+		end
+	end)
 end
 
 -- Raio horizontal do corpo (ignora acessórios/ferramentas, que inflam a caixa)
@@ -91,16 +130,30 @@ local function readHp(o, npc)
 end
 
 local function findTarget(char, hrp, o, ignored)
-	local best, bestD = nil, o.searchRadius
+	local best, bestScore = nil, math.huge
 	local now = os.clock()
-	for _, h in ipairs(workspace:GetDescendants()) do
-		if h:IsA("Humanoid") then
-			local npc = h.Parent
-			if npc:IsA("Model") and npc ~= char and not Players:GetPlayerFromCharacter(npc)
-				and alive(npc) and nameOk(npc, o.targetNames)
-				and (not ignored[npc] or now > ignored[npc]) then
-				local d = (getRoot(npc).Position - hrp.Position).Magnitude
-				if d < bestD then best, bestD = npc, d end
+	for npc in pairs(npcSet) do
+		if not npc.Parent then
+			npcSet[npc] = nil
+		elseif npc ~= char and not Players:GetPlayerFromCharacter(npc)
+			and alive(npc) and nameOk(npc, o.targetNames)
+			and (not ignored[npc] or now > ignored[npc]) then
+			local pos = getRoot(npc).Position
+			local d = (pos - hrp.Position).Magnitude
+			local inArea = (not o.farmPoint) or (pos - o.farmPoint).Magnitude <= o.areaRadius
+			local pass = true
+			if o.npcFilter then
+				local ok, r = pcall(o.npcFilter, npc)
+				pass = (ok and r) and true or false
+			end
+			if d <= o.searchRadius and inArea and pass then
+				local score = d
+				if o.priority == "lowestHp" then
+					score = readHp(o, npc) + d * 0.01
+				elseif o.priority == "highestHp" then
+					score = -readHp(o, npc) + d * 0.01
+				end
+				if score < bestScore then best, bestScore = npc, score end
 			end
 		end
 	end
@@ -147,6 +200,10 @@ function Autofarm.enable(player, distanceFn, options)
 
 	local o = {
 		searchRadius    = 1000,
+		priority        = "nearest",
+		farmPoint       = nil,
+		areaRadius      = 150,
+		hud             = true,
 		gap             = nil,
 		heightOffset    = 0,
 		orbit           = true,
@@ -174,6 +231,30 @@ function Autofarm.enable(player, distanceFn, options)
 
 	session += 1
 	local id = session
+	buildCache()
+
+	local hudLabel, lastHud = nil, 0
+	if o.hud then
+		local pg = player:FindFirstChildOfClass("PlayerGui")
+		if pg then
+			hudGui = Instance.new("ScreenGui")
+			hudGui.Name = "AutofarmHud"
+			hudGui.ResetOnSpawn = false
+			hudGui.DisplayOrder = 100
+			hudLabel = Instance.new("TextLabel")
+			hudLabel.Size = UDim2.fromOffset(270, 66)
+			hudLabel.Position = UDim2.new(0, 10, 0.5, -33)
+			hudLabel.BackgroundColor3 = Color3.new(0, 0, 0)
+			hudLabel.BackgroundTransparency = 0.4
+			hudLabel.TextColor3 = Color3.new(1, 1, 1)
+			hudLabel.Font = Enum.Font.Code
+			hudLabel.TextSize = 14
+			hudLabel.TextXAlignment = Enum.TextXAlignment.Left
+			hudLabel.Text = ""
+			hudLabel.Parent = hudGui
+			hudGui.Parent = pg
+		end
+	end
 
 	local gap = o.gap or (distanceFn and distanceFn() or 3)
 	local radius, distance = 0, 0
@@ -202,7 +283,16 @@ function Autofarm.enable(player, distanceFn, options)
 	end))
 
 	table.insert(conns, RunService.Heartbeat:Connect(function(dt)
-		if session ~= id or paused then return end
+		if session ~= id then return end
+
+		if hudLabel and os.clock() - lastHud > 0.25 then
+			lastHud = os.clock()
+			local hp = target and readHp(o, target) or 0
+			hudLabel.Text = string.format(" AUTOFARM %s\n Alvo: %s (vida %.0f)\n Kills: %d | perfil %d/%d | gap %.1f",
+				paused and "[PAUSADO]" or "[ON]", target and target.Name or "procurando...", hp, kills, profIdx, #profiles, gap)
+		end
+
+		if paused then return end
 
 		local char = player.Character
 		local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -367,6 +457,13 @@ function Autofarm.disable()
 	session += 1
 	for _, c in ipairs(conns) do c:Disconnect() end
 	conns = {}
+	for _, c in ipairs(cacheConns) do c:Disconnect() end
+	cacheConns = {}
+	npcSet = {}
+	if hudGui then
+		hudGui:Destroy()
+		hudGui = nil
+	end
 	if lastHum then
 		lastHum.AutoRotate = true
 		lastHum = nil
