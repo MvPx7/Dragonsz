@@ -1,26 +1,34 @@
--- modules/autofarm.lua  (v2: anda de verdade até o NPC, sem teleporte)
+-- modules/autofarm.lua  (v3: ataque sem depender do mouse, combate por faixa de distância, desvio lateral)
 --
--- O que faz:
---   * Procura NPCs (todos, ou só os que você filtrar) e CAMINHA até a área deles usando
---     pathfinding (desvia de paredes, pula obstáculos). Nada de teletransporte.
---   * Perto do NPC: fica na distância certa da hitbox, mira nele (mesmo com Trava Shift)
---     e ataca sozinho.
---   * Desvia quando o NPC começa uma animação de ataque.
---   * Se a vida ficar baixa, recua; volta quando recuperar.
---   * Detecta a morte do NPC e vai para o próximo. Se não houver NPC (respawn), volta para a área.
+-- O que mudou na v3:
+--   * Ataque direto via RemoteEvent (attackRemote) ou função própria (clickFn): NÃO usa o M1,
+--     então funciona mesmo com o mouse sobre menus.
+--   * Combate fica do lado em que você já está, dentro de uma faixa de distância (sem contornar o NPC).
+--   * Raio do NPC calculado pela HumanoidRootPart (hitbox real), não pelo modelo inteiro.
+--   * Desvio lateral (strafe) em vez de recuar em linha reta.
+--   * Sinal confiável de ataque: atributo "Attacking" no NPC (definido pelo servidor),
+--     além da detecção por animação.
 --
 -- Uso:
---   Autofarm.enable(player, distanceFn)
 --   Autofarm.enable(player, distanceFn, {
---       targetNames = { "Scorpion" },                 -- só ataca NPCs com esse texto no nome
---       farmPoint   = Vector3.new(100, 5, -300),      -- área de farm (anda até lá se não houver NPC)
---       areaRadius  = 120,                            -- só NPCs a até 120 studs do farmPoint
+--       attackRemote = ReplicatedStorage.Remotes.Attack,       -- RemoteEvent do seu M1
+--       attackArgs   = function(npc) return npc end,           -- argumentos que o M1 manda (opcional)
+--       targetNames  = { "Scorpion" },
+--       farmPoint    = Vector3.new(100, 5, -300),
+--       areaRadius   = 120,
 --   })
 --   Autofarm.disable()
 --   Autofarm.getKills()
 --
+-- Servidor (no script do NPC), no início do wind-up de cada ataque:
+--   npc:SetAttribute("Attacking", true)
+--   task.delay(windupTime, function() npc:SetAttribute("Attacking", false) end)
+--
+-- IMPORTANTE: valide NO SERVIDOR se o jogador é ADM e a distância até o NPC antes de aceitar
+-- ataques automatizados, para o autofarm não virar brecha para qualquer um.
+--
 -- Teclas (enquanto ligado):
---   RightControl = pausa / retoma TUDO (andar + cliques). Use ao abrir menus.
+--   RightControl = pausa / retoma TUDO (andar + ataques)
 --   F7           = imprime no Output os dados do NPC mais próximo (diagnóstico)
 --
 -- Diagnóstico: { debug = true } imprime linhas [Autofarm] no Output / Console (F9).
@@ -49,13 +57,15 @@ local DEFAULTS = {
 	engageDistance    = 14,      -- studs do corpo do NPC em que passa de "viajar" para "combate"
 	pathRecompute     = 1.5,     -- segundos entre recálculos do caminho
 	waypointReach     = 3.5,     -- distância para considerar um waypoint alcançado
-	behindNpc         = true,    -- tenta ficar nas costas do NPC
 	lockAim           = true,    -- personagem sempre virado para o NPC em combate (vence a Trava Shift)
+	rangeFactor       = 0.8,     -- fica a (alcance * fator) do NPC: <1 = um pouco DENTRO do alcance
 
 	-- Defesa
-	dodgeOnAttack     = true,    -- desvia quando o NPC começa uma animação de ataque
-	dodgeBack         = 7,       -- quantos studs recua ao desviar
-	dodgeMaxTime      = 1.2,     -- tempo máximo de cada desvio (s)
+	dodgeOnAttack     = true,    -- desvia quando o NPC ataca
+	dodgeBack         = 8,       -- quantos studs anda para o lado ao desviar (strafe)
+	dodgeMaxTime      = 1.2,     -- tempo máximo de cada desvio por animação (s)
+	dodgeAttribute    = "Attacking", -- atributo do NPC (setado pelo servidor) que sinaliza ataque; nil desliga
+	dodgeAttrTime     = 0.6,     -- duração do desvio quando o atributo sinaliza ataque (s)
 	isAttackAnimFn    = nil,     -- função(track) -> true se a animação do NPC é um ataque
 	attackWhileDodging = false,  -- ataca enquanto desvia?
 	minHealthPct      = 0.3,     -- recua quando a vida ficar abaixo disso (0 desliga)
@@ -63,14 +73,17 @@ local DEFAULTS = {
 	retreatDistance   = 35,      -- até onde recua (studs)
 	retreatMaxTime    = 15,      -- tempo máximo recuado (s)
 	onLowHealth       = nil,     -- função(pctVida): chamada ao recuar (ex.: usar cura)
+	dashFn            = nil,     -- função(side): opcional, chamada ao desviar (ex.: disparar dash/esquiva via remote)
 
-	-- Ataque
+	-- Ataque (sem depender do mouse)
 	attackInterval    = 0.15,    -- segundos entre ataques
-	attackMode        = "auto",  -- "auto" | "native" | "click" | "hold" | "tool"
-	clickFn           = nil,     -- função própria de ataque (substitui attackMode)
+	attackRemote      = nil,     -- RemoteEvent de ataque do seu jogo (recomendado)
+	attackArgs        = nil,     -- função(npc) -> ... : argumentos enviados ao attackRemote
+	clickFn           = nil,     -- função(npc) própria de ataque (substitui tudo abaixo)
+	attackMode        = "auto",  -- (fallback, só se não houver attackRemote/clickFn) "auto"|"native"|"click"|"hold"|"tool"
 	requireRange      = true,    -- só ataca dentro do alcance estimado
 	reachPadding      = 1.5,     -- tolerância extra do alcance (studs)
-	safeClick         = true,    -- NÃO clica com menu aberto / mouse sobre botão / janela sem foco
+	safeClick         = true,    -- (só no fallback por input) NÃO clica com menu aberto / mouse sobre botão
 
 	-- Morte / alvo
 	isDeadFn          = nil,     -- função(npc) -> true se o NPC está morto
@@ -199,8 +212,12 @@ local function isNPC(model, myChar)
 	return isAlive(model)
 end
 
--- Raio horizontal real do NPC (caixa que envolve o modelo inteiro)
+-- Raio horizontal da hitbox real (HumanoidRootPart). Só cai para a caixa do modelo se não houver raiz.
 local function getRadius(model)
+	local root = getRoot(model)
+	if root then
+		return math.max(root.Size.X, root.Size.Z) / 2
+	end
 	local _, size = model:GetBoundingBox()
 	return math.max(size.X, size.Z) / 2
 end
@@ -270,7 +287,7 @@ local function aimAtTarget(s, hrp)
 end
 
 ----------------------------------------------------------------
--- Segurança do clique (evita clicar em menus)
+-- Segurança do clique (só usado no fallback por input simulado)
 ----------------------------------------------------------------
 local function cursorOverUi(s)
 	local pg = s.player:FindFirstChildOfClass("PlayerGui")
@@ -345,6 +362,15 @@ local function describeNpc(npc)
 	return table.concat(parts, " | ")
 end
 
+-- Agenda um desvio (usado pela animação e pelo atributo "Attacking")
+local function triggerDodge(s, duration)
+	s.dodgeUntil = os.clock() + duration
+	s.dodgeSide = -s.dodgeSide
+	if s.opts.dashFn then
+		task.spawn(s.opts.dashFn, s.dodgeSide)
+	end
+end
+
 local function setTarget(s, npc)
 	clearTargetConns(s)
 	s.target = npc
@@ -371,6 +397,17 @@ local function setTarget(s, npc)
 	table.insert(s.targetConns, npc.AncestryChanged:Connect(function(_, parent)
 		if not parent then dropTarget(s, npc, false, "removido do jogo") end
 	end))
+
+	-- Sinal confiável de ataque: atributo setado pelo servidor no início do wind-up
+	local attr = s.opts.dodgeAttribute
+	if attr and s.opts.dodgeOnAttack then
+		table.insert(s.targetConns, npc:GetAttributeChangedSignal(attr):Connect(function()
+			if npc:GetAttribute(attr) == true then
+				log(s, "NPC sinalizou ataque via atributo", attr)
+				triggerDodge(s, s.opts.dodgeAttrTime)
+			end
+		end))
+	end
 end
 
 ----------------------------------------------------------------
@@ -550,24 +587,20 @@ local function pollAttackAnim(s)
 
 			if isAttack and s.opts.dodgeOnAttack then
 				local len = track.Length > 0 and track.Length or 0.8
-				s.dodgeUntil = os.clock() + math.min(len, s.opts.dodgeMaxTime)
-				s.dodgeSide = -s.dodgeSide
+				triggerDodge(s, math.min(len, s.opts.dodgeMaxTime))
 			end
 		end
 	end
 	s.prevPlaying = playing
 end
 
+-- Desvio lateral (strafe): sai da linha do golpe, mas continua perto do NPC
 local function dodgePosition(s, hrp, npcPos)
-	local away = Vector3.new(hrp.Position.X - npcPos.X, 0, hrp.Position.Z - npcPos.Z)
-	if away.Magnitude < 0.01 then
-		away = -hrp.CFrame.LookVector
-		away = Vector3.new(away.X, 0, away.Z)
-	end
-	away = away.Unit
-	local rotated = CFrame.Angles(0, math.rad(35) * s.dodgeSide, 0):VectorToWorldSpace(away)
-	local dist = s.radius + MY_RADIUS + s.distanceFn() + s.opts.dodgeBack
-	return Vector3.new(npcPos.X, hrp.Position.Y, npcPos.Z) + rotated * dist
+	local out = Vector3.new(hrp.Position.X - npcPos.X, 0, hrp.Position.Z - npcPos.Z)
+	if out.Magnitude < 0.01 then out = Vector3.new(0, 0, 1) end
+	out = out.Unit
+	local tangent = Vector3.new(-out.Z, 0, out.X) * s.dodgeSide
+	return hrp.Position + tangent * s.opts.dodgeBack + out * 2
 end
 
 local function updateTargetState(s, now)
@@ -701,26 +734,25 @@ local function navStep(s)
 	hum.AutoRotate = false
 	s.path = nil
 
-	local goal
-	if s.opts.dodgeOnAttack and now < s.dodgeUntil then
-		goal = dodgePosition(s, hrp, npcPos)
-	else
-		local dir
-		if s.opts.behindNpc then
-			dir = -nHrp.CFrame.LookVector
-		else
-			dir = hrp.Position - npcPos
-		end
-		dir = Vector3.new(dir.X, 0, dir.Z)
-		if dir.Magnitude < 0.01 then
-			dir = -hrp.CFrame.LookVector
-			dir = Vector3.new(dir.X, 0, dir.Z)
-		end
-		goal = Vector3.new(npcPos.X, hrp.Position.Y, npcPos.Z) + dir.Unit * offset
-	end
-	hum:MoveTo(goal)
+	local dodging = s.opts.dodgeOnAttack and now < s.dodgeUntil
+	local desired = (getReach(s) - s.opts.reachPadding) * s.opts.rangeFactor -- fica um pouco DENTRO do alcance
 
-	debugTick(s, hrp, (s.opts.dodgeOnAttack and now < s.dodgeUntil) and "desviando" or "combate")
+	if dodging then
+		hum:MoveTo(dodgePosition(s, hrp, npcPos))
+	else
+		local out = Vector3.new(hrp.Position.X - npcPos.X, 0, hrp.Position.Z - npcPos.Z)
+		if out.Magnitude < 0.01 then out = Vector3.new(0, 0, 1) end
+		local dir = out.Unit
+
+		if flat > desired + 1 or flat < desired * 0.5 then
+			-- reposiciona pelo lado em que já está (sem contornar o NPC)
+			hum:MoveTo(Vector3.new(npcPos.X, hrp.Position.Y, npcPos.Z) + dir * desired)
+		else
+			hum:MoveTo(hrp.Position) -- já está bom, só fica parado mirando
+		end
+	end
+
+	debugTick(s, hrp, dodging and "desviando" or "combate")
 end
 
 local function navLoop(s)
@@ -751,11 +783,27 @@ end
 -- Ataque automático
 ----------------------------------------------------------------
 local function swing(s, char)
+	local npc = s.target
+
+	-- 1) Função própria: substitui tudo (sem input, sem safeClick)
 	if s.opts.clickFn then
-		pcall(s.opts.clickFn)
+		pcall(s.opts.clickFn, npc)
 		return
 	end
 
+	-- 2) RemoteEvent de ataque: sem input, funciona com o mouse sobre menus
+	if s.opts.attackRemote then
+		pcall(function()
+			if s.opts.attackArgs then
+				s.opts.attackRemote:FireServer(s.opts.attackArgs(npc))
+			else
+				s.opts.attackRemote:FireServer()
+			end
+		end)
+		return
+	end
+
+	-- 3) Fallback por input simulado (depende do mouse/UI)
 	local mode = s.opts.attackMode
 	local cam = workspace.CurrentCamera
 
@@ -890,8 +938,11 @@ function Autofarm.enable(player, distanceFn, options)
 	}
 	state = s
 
-	if type(mouse1click) ~= "function" and (opts.attackMode == "auto" or opts.attackMode == "native") and not opts.clickFn then
-		warn("[Autofarm] mouse1click não existe neste ambiente: o clique automático pode não funcionar.")
+	if not opts.clickFn and not opts.attackRemote then
+		warn("[Autofarm] nenhum attackRemote/clickFn definido: usando clique simulado, que depende do mouse/UI. Defina attackRemote para atacar sem o M1.")
+		if type(mouse1click) ~= "function" and (opts.attackMode == "auto" or opts.attackMode == "native") then
+			warn("[Autofarm] mouse1click não existe neste ambiente: o clique automático pode não funcionar.")
+		end
 	end
 
 	if opts.captureController then
@@ -911,7 +962,8 @@ function Autofarm.enable(player, distanceFn, options)
 		end
 	end))
 
-	log(s, "ligado | attackMode =", opts.attackMode, "| mouse1click disponível =", type(mouse1click) == "function")
+	log(s, "ligado | attackRemote =", opts.attackRemote and opts.attackRemote:GetFullName() or "nenhum",
+		"| clickFn =", opts.clickFn ~= nil, "| attackMode =", opts.attackMode)
 
 	RunService:BindToRenderStep(AIM_STEP, Enum.RenderPriority.Camera.Value + 1, aim)
 	s.attackConn = RunService.Heartbeat:Connect(attack)
