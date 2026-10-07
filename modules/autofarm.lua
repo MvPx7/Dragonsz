@@ -1,4 +1,4 @@
--- autofarm_v8.lua
+-- autofarm_v9.lua
 -- Autofarm "grudado" com AUTO-CALIBRAÇÃO:
 --   * Fica em volta do NPC (órbita ou atrás), sempre virado pra ele, atacando sem mouse.
 --   * Distância calculada por NPC (raio do corpo + seu raio + folga), então NPC grande funciona.
@@ -29,7 +29,7 @@
 --   burst = 1            quantos ataques por disparo (aumente com cuidado: o servidor pode limitar)
 --   attackInterval = 0.12
 --   autoCalibrate = true / calibrateAfter = 1.2 (s sem dano para trocar de perfil) / skipAfterFail = 20
---   minHealthPct = 0.3 / resumeHealthPct = 0.7 / safeHeight = 60 / onLowHealth = function(pct) end
+--   minHealthPct = 0 (desligado; 0.3 = recua com 30% de vida) / resumeHealthPct = 0.7 / safeHeight = 60 / onLowHealth = function(pct) end
 --
 -- Teclas: RightControl = pausa/retoma | [ e ] = diminui/aumenta a folga
 
@@ -159,7 +159,7 @@ function Autofarm.enable(player, distanceFn, options)
 		autoCalibrate   = true,
 		calibrateAfter  = 1.2,
 		skipAfterFail   = 20,
-		minHealthPct    = 0.3,
+		minHealthPct    = 0,     -- 0 = nunca recua. Ex.: 0.3 = foge quando a vida cair abaixo de 30%
 		resumeHealthPct = 0.7,
 		safeHeight      = 40,
 		retreatDistance = 150,
@@ -219,10 +219,11 @@ function Autofarm.enable(player, distanceFn, options)
 				if pct >= o.resumeHealthPct or now - retreatStart > o.lowHealthMaxTime then
 					retreating = false
 					safePos = nil
+					print("[Autofarm] recuo terminou, voltando ao combate")
 				end
 			elseif pct <= o.minHealthPct then
 				retreating, retreatStart, safePos = true, now, nil
-				if o.debug then print("[Autofarm] vida baixa, recuando:", math.floor(pct * 100) .. "%") end
+				print("[Autofarm] VIDA BAIXA (" .. math.floor(pct * 100) .. "%): recuando para longe e esperando recuperar. Para desligar isso: minHealthPct = 0")
 				if o.onLowHealth then task.spawn(o.onLowHealth, pct) end
 			end
 		end
