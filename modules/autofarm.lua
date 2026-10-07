@@ -26,6 +26,12 @@
 --   npcFilter = function(npc) return true end          filtro extra (ex.: por nível)
 --   hud = true                                         (opcional) painel na tela; padrão: desligado
 --
+-- Esquiva automática (evade = true por padrão):
+--   Quando o NPC começa um ataque (animação de ataque, ou atributo "Attacking" setado pelo servidor)
+--   ou quando você leva dano, o personagem vai para trás do NPC, mais longe e um pouco acima,
+--   e volta a atacar quando o golpe passa. Ajuste: evadeOut, evadeUp, evadeMaxTime, evadeOnHit.
+--   Com debug = true ele imprime quando esquiva e quantas vezes cada NPC te acertou.
+--
 -- Modo "mata tudo por perto" (tudo no mesmo arquivo, sem servidor extra):
 --   aura = true, auraRadius = 30, auraMax = 10   a cada golpe, ataca também TODOS os NPCs no raio
 --   stationary = true                            fica PARADO e só ataca todos os NPCs no raio
@@ -60,6 +66,13 @@ local lastHum
 local hudGui
 
 local MY_RADIUS = 1.5
+
+local ATTACK_PRIORITIES = {
+	[Enum.AnimationPriority.Action] = true,
+	[Enum.AnimationPriority.Action2] = true,
+	[Enum.AnimationPriority.Action3] = true,
+	[Enum.AnimationPriority.Action4] = true,
+}
 
 ----------------------------------------------------------------
 -- Utilidades
@@ -271,6 +284,13 @@ function Autofarm.enable(player, distanceFn, options)
 		skipInteractive = true,   -- ignora NPCs com ProximityPrompt/ClickDetector/Dialog (quest, loja)
 		ignoreNames     = nil,    -- { "texto" } nomes extras para NUNCA atacar
 		maxTimeNoDamage = 10,     -- s sem tirar vida de um NPC => ignora ele
+		evade           = true,   -- esquiva sozinho quando o NPC ataca (veja abaixo)
+		evadeOut        = 10,     -- studs a mais para trás do NPC ao esquivar
+		evadeUp         = 4,      -- studs para cima ao esquivar (sai de ataque no chão)
+		evadeMaxTime    = 1.0,    -- duração máxima de cada esquiva (s)
+		evadeOnHit      = 0.8,    -- se você levar dano, sai de perto por esse tempo (s)
+		dodgeAttribute  = "Attacking", -- atributo do NPC (setado pelo servidor) que sinaliza ataque
+		isAttackAnimFn  = nil,    -- function(track) -> true se a animação do NPC é um ataque
 		gap             = nil,
 		heightOffset    = 0,
 		orbit           = true,
@@ -330,6 +350,9 @@ function Autofarm.enable(player, distanceFn, options)
 	local profIdx, profStart, lastHp, lastDamage = 1, 0, 0, 0
 	local failCycles, everSawDamage, calibrating = 0, false, o.autoCalibrate
 	local failTargets, gotDamage, targetStart = 0, false, 0
+	local evadeUntil, myLastHp, prevPlaying, prevFlag = 0, nil, nil, false
+	local animator, animFor, lastAnimPoll = nil, nil, 0
+	local hitCount = {}
 	local retreating, retreatStart, safePos = false, 0, nil
 	local inPos = false
 	local paused = false
@@ -429,6 +452,7 @@ function Autofarm.enable(player, distanceFn, options)
 					profIdx = learned[target.Name] or 1
 					profStart, lastDamage, inPos = now, now, false
 					targetStart, gotDamage = now, false
+					evadeUntil, prevPlaying, prevFlag = 0, nil, false
 					lastHp = readHp(o, target)
 					print(string.format("[Autofarm] alvo: %s | raio: %.1f | perfil inicial: %d%s",
 						target.Name, radius, profIdx, learned[target.Name] and " (aprendido)" or ""))
@@ -445,6 +469,58 @@ function Autofarm.enable(player, distanceFn, options)
 		local npcPos = npcRoot.Position
 		local myPos = hrp.Position
 
+		-- detecta ataque do NPC e agenda esquiva
+		if o.evade then
+			-- 1) sinal do servidor (atributo)
+			local flag = o.dodgeAttribute and target:GetAttribute(o.dodgeAttribute) == true
+			if flag and not prevFlag then
+				evadeUntil = math.max(evadeUntil, now + o.evadeMaxTime * 0.6)
+			end
+			prevFlag = flag
+
+			-- 2) início de animação de ataque do NPC
+			if now - lastAnimPoll > 0.05 then
+				lastAnimPoll = now
+				if animFor ~= target then
+					animFor = target
+					animator = target:FindFirstChildWhichIsA("Animator", true)
+				end
+				local playing = {}
+				if animator then
+					for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+						playing[tr] = true
+						if prevPlaying and not prevPlaying[tr] then
+							local isAtk
+							if o.isAttackAnimFn then
+								local ok, r = pcall(o.isAttackAnimFn, tr)
+								isAtk = ok and r == true
+							else
+								isAtk = (not tr.Looped) and ATTACK_PRIORITIES[tr.Priority] == true
+							end
+							if isAtk then
+								local len = tr.Length > 0 and tr.Length or 0.8
+								evadeUntil = math.max(evadeUntil, now + math.min(len, o.evadeMaxTime))
+								if o.debug then print("[Autofarm] NPC atacando (anim " .. tr.Name .. "), esquivando") end
+							end
+						end
+					end
+				end
+				prevPlaying = playing
+			end
+
+			-- 3) você tomou dano: sai de perto por um instante
+			local myHp = hum.Health
+			if myLastHp and myHp < myLastHp - 0.5 then
+				evadeUntil = math.max(evadeUntil, now + o.evadeOnHit)
+				hitCount[target.Name] = (hitCount[target.Name] or 0) + 1
+				if o.debug then
+					print(string.format("[Autofarm] levou dano de '%s' (%d vezes), esquivando", target.Name, hitCount[target.Name]))
+				end
+			end
+			myLastHp = myHp
+		end
+		local evading = o.evade and now < evadeUntil
+
 		local desired
 		if prof.orbit then
 			angle += o.orbitSpeed * dt
@@ -453,6 +529,11 @@ function Autofarm.enable(player, distanceFn, options)
 			desired = (npcRoot.CFrame * CFrame.new(0, 0, distance)).Position -- atrás do NPC
 		end
 		desired = Vector3.new(desired.X, npcPos.Y + o.heightOffset + (prof.h or 0), desired.Z)
+		if evading and not retreating then
+			-- esquiva: vai para trás do NPC, mais longe e um pouco acima (sai do cone frontal e de golpe no chão)
+			local back = (npcRoot.CFrame * CFrame.new(0, 0, distance + o.evadeOut)).Position
+			desired = Vector3.new(back.X, npcPos.Y + o.heightOffset + o.evadeUp, back.Z)
+		end
 		if retreating then
 			-- ponto seguro FIXO, longe do NPC (calculado uma vez, não segue o NPC)
 			if not safePos then
@@ -478,7 +559,7 @@ function Autofarm.enable(player, distanceFn, options)
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.AssemblyAngularVelocity = Vector3.zero
 
-		inPos = (newPos - desired).Magnitude < 1 and not retreating
+		inPos = (newPos - desired).Magnitude < 1 and not retreating and not evading
 
 		-- ataque
 		if inPos then
