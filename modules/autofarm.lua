@@ -1,4 +1,4 @@
--- autofarm_v7.lua
+-- autofarm_v8.lua
 -- Autofarm "grudado" com AUTO-CALIBRAÇÃO:
 --   * Fica em volta do NPC (órbita ou atrás), sempre virado pra ele, atacando sem mouse.
 --   * Distância calculada por NPC (raio do corpo + seu raio + folga), então NPC grande funciona.
@@ -6,7 +6,9 @@
 --     outros perfis (distâncias, órbita/parado, altura) até achar o que acerta.
 --   * Memoriza o perfil que funcionou para cada nome de NPC (o próximo "Kick Boxer" já começa certo).
 --   * Se nenhum perfil acertar aquele NPC, ignora ele por um tempo e vai pro próximo.
---   * Vida baixa: sobe pra longe do chão e espera recuperar (e chama onLowHealth, ex.: usar cura).
+--   * Vida baixa: foge PARA LONGE do NPC (retreatDistance) e fica parado esperando recuperar
+--     (e chama onLowHealth, ex.: usar cura).
+--   * Autofarm.inspect(): imprime no Output os dados do NPC mais próximo (vida, atributos, nível...).
 --
 -- Uso:
 --   Autofarm.enable(player, function() return 3 end, {
@@ -159,7 +161,8 @@ function Autofarm.enable(player, distanceFn, options)
 		skipAfterFail   = 20,
 		minHealthPct    = 0.3,
 		resumeHealthPct = 0.7,
-		safeHeight      = 60,
+		safeHeight      = 40,
+		retreatDistance = 150,
 		lowHealthMaxTime = 15,
 		debug           = false,
 	}
@@ -178,7 +181,7 @@ function Autofarm.enable(player, distanceFn, options)
 	local learned, ignored = {}, {}
 	local profIdx, profStart, lastHp, lastDamage = 1, 0, 0, 0
 	local failCycles, everSawDamage, calibrating = 0, false, o.autoCalibrate
-	local retreating, retreatStart = false, 0
+	local retreating, retreatStart, safePos = false, 0, nil
 	local inPos = false
 	local paused = false
 	local target, angle = nil, 0
@@ -215,9 +218,10 @@ function Autofarm.enable(player, distanceFn, options)
 			if retreating then
 				if pct >= o.resumeHealthPct or now - retreatStart > o.lowHealthMaxTime then
 					retreating = false
+					safePos = nil
 				end
 			elseif pct <= o.minHealthPct then
-				retreating, retreatStart = true, now
+				retreating, retreatStart, safePos = true, now, nil
 				if o.debug then print("[Autofarm] vida baixa, recuando:", math.floor(pct * 100) .. "%") end
 				if o.onLowHealth then task.spawn(o.onLowHealth, pct) end
 			end
@@ -264,7 +268,15 @@ function Autofarm.enable(player, distanceFn, options)
 			desired = (npcRoot.CFrame * CFrame.new(0, 0, distance)).Position -- atrás do NPC
 		end
 		desired = Vector3.new(desired.X, npcPos.Y + o.heightOffset + (prof.h or 0), desired.Z)
-		if retreating then desired += Vector3.new(0, o.safeHeight, 0) end
+		if retreating then
+			-- ponto seguro FIXO, longe do NPC (calculado uma vez, não segue o NPC)
+			if not safePos then
+				local away = Vector3.new(myPos.X - npcPos.X, 0, myPos.Z - npcPos.Z)
+				if away.Magnitude < 0.01 then away = Vector3.new(0, 0, 1) end
+				safePos = npcPos + away.Unit * o.retreatDistance + Vector3.new(0, o.safeHeight, 0)
+			end
+			desired = safePos
+		end
 
 		-- grudado: vai direto; longe: desliza rápido
 		local delta = desired - myPos
@@ -357,6 +369,36 @@ function Autofarm.disable()
 	if lastHum then
 		lastHum.AutoRotate = true
 		lastHum = nil
+	end
+end
+
+-- Imprime os dados do NPC mais próximo (vida, atributos, valores, nível...)
+function Autofarm.inspect()
+	local char = Players.LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+	local best, bestD = nil, math.huge
+	for _, h in ipairs(workspace:GetDescendants()) do
+		if h:IsA("Humanoid") and h.Parent:IsA("Model") and h.Parent ~= char
+			and not Players:GetPlayerFromCharacter(h.Parent) and getRoot(h.Parent) then
+			local d = (getRoot(h.Parent).Position - hrp.Position).Magnitude
+			if d < bestD then best, bestD = h.Parent, d end
+		end
+	end
+	if not best then print("[Autofarm][inspect] nenhum NPC") return end
+	print("[Autofarm][inspect]", best:GetFullName())
+	local hum = best:FindFirstChildOfClass("Humanoid")
+	print("  Humanoid:", hum.Health, "/", hum.MaxHealth)
+	for k, v in pairs(best:GetAttributes()) do print("  attr", k, v) end
+	for k, v in pairs(hum:GetAttributes()) do print("  attr(Humanoid)", k, v) end
+	for _, c in ipairs(best:GetChildren()) do
+		if c:IsA("ValueBase") then print("  valor", c.ClassName, c.Name, c.Value) end
+	end
+	local p = Players.LocalPlayer
+	for k, v in pairs(p:GetAttributes()) do print("  [você] attr", k, v) end
+	local ls = p:FindFirstChild("leaderstats")
+	if ls then
+		for _, c in ipairs(ls:GetChildren()) do print("  [você] leaderstats", c.Name, c.Value) end
 	end
 end
 
